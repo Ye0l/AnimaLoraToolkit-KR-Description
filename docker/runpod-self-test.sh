@@ -7,12 +7,12 @@ bash -n "$app_dir/docker/entrypoint.sh"
 bash -n "$app_dir/docker/train-runpod.sh"
 python -m py_compile \
     "$app_dir/anima_train.py" \
-    "$app_dir/docker/download_models.py" \
+    "$app_dir/docker/download_models_direct.py" \
     "$app_dir/docker/preflight.py"
 python -m pip check
 python -m uploadserver --help >/dev/null
 /usr/sbin/sshd -t
-python "$app_dir/docker/download_models.py" --self-test
+python "$app_dir/docker/download_models_direct.py" --self-test
 
 python - "$app_dir/config/runpod-docker.yaml" <<'PY'
 from pathlib import Path
