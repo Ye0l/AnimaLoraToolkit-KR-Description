@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import types
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -1336,13 +1337,14 @@ class ImageDataset(Dataset):
         logger.info(f"数据集: {len(self.samples)} 样本 (JSON: {json_count}, TXT: {txt_count})")
 
     def _scan(self):
+        from PIL import Image
         samples = []
         for img_path in self.data_dir.rglob("*"):
             if img_path.suffix.lower() not in self.EXTS:
                 continue
-            
+
             sample = {"image": img_path}
-            
+
             # 优先查找 JSON
             json_path = img_path.with_suffix(".json")
             if self.prefer_json and json_path.exists():
@@ -1357,7 +1359,15 @@ class ImageDataset(Dataset):
                     continue
                 sample["json_path"] = None
                 sample["txt_path"] = txt_path
-            
+
+            # 预先计算分桶尺寸（仅读取图像头，不解码像素），用于按桶分批
+            with Image.open(img_path) as im:
+                w, h = im.size
+            if self.bucket_mgr:
+                sample["bucket"] = self.bucket_mgr.get_bucket(w, h)
+            else:
+                sample["bucket"] = (self.resolution, self.resolution)
+
             samples.append(sample)
         return samples
 
@@ -1430,11 +1440,8 @@ class ImageDataset(Dataset):
         if caption is None:
             caption = ""
 
-        # ARB 分桶
-        if self.bucket_mgr:
-            tw, th = self.bucket_mgr.get_bucket(img.width, img.height)
-        else:
-            tw = th = self.resolution
+        # ARB 分桶（使用扫描阶段缓存的分桶尺寸，保证与 BucketBatchSampler 一致）
+        tw, th = sample.get("bucket", (self.resolution, self.resolution))
 
         # 缩放裁剪
         scale = max(tw / img.width, th / img.height)
@@ -1699,6 +1706,47 @@ def sample_t(bs, device):
     shift = 3.0
     t = (t * shift) / (1 + (shift - 1) * t)
     return t
+
+
+class BucketBatchSampler(torch.utils.data.Sampler):
+    """按 ARB 分桶分组的 batch sampler，确保同一批次内图像尺寸一致。"""
+
+    def __init__(self, bucket_keys, batch_size, shuffle=True, drop_last=False):
+        self.bucket_keys = bucket_keys
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+    def _batches(self):
+        by_bucket = defaultdict(list)
+        for idx, key in enumerate(self.bucket_keys):
+            by_bucket[key].append(idx)
+
+        batches = []
+        for indices in by_bucket.values():
+            if self.shuffle:
+                random.shuffle(indices)
+            for i in range(0, len(indices), self.batch_size):
+                chunk = indices[i:i + self.batch_size]
+                if self.drop_last and len(chunk) < self.batch_size:
+                    continue
+                batches.append(chunk)
+
+        if self.shuffle:
+            random.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches())
+
+    def __len__(self):
+        counts = defaultdict(int)
+        for key in self.bucket_keys:
+            counts[key] += 1
+        total = 0
+        for count in counts.values():
+            total += (count // self.batch_size) if self.drop_last else -(-count // self.batch_size)
+        return total
 
 
 def collate_fn(batch):
@@ -2033,9 +2081,16 @@ def main():
         logger.warning("num_workers > 0 在 Windows 上容易崩溃：已强制设为 0（避免多进程 spawn 问题）")
         args.num_workers = 0
 
+    # 按分桶分组的 batch sampler：保证同一批次内图像/latent 尺寸一致，
+    # 否则不同长宽比图像混入同一批会导致 torch.stack 报错。
+    base_len = len(base_dataset)
+    base_bucket_keys = [s["bucket"] for s in base_dataset.samples]
+    bucket_keys = [base_bucket_keys[i % base_len] for i in range(len(dataset))]
+    batch_sampler = BucketBatchSampler(bucket_keys, args.batch_size, shuffle=True)
+
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size,
-        shuffle=True,
+        dataset,
+        batch_sampler=batch_sampler,
         collate_fn=collate_fn_cached if use_cached else collate_fn,
         num_workers=args.num_workers
     )
