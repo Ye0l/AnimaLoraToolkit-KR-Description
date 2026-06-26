@@ -88,7 +88,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
 COPY . ${APP_DIR}
 
 RUN cat > ${APP_DIR}/config/runpod-docker.yaml <<'YAML'
-transformer_path: "/workspace/models/transformers/anima.safetensors"
+transformer_path: "/workspace/models/transformers/anima-preview.safetensors"
 vae_path: "/workspace/models/vae/qwen_image_vae.safetensors"
 text_encoder_path: "/workspace/models/text_encoders"
 t5_tokenizer_path: "/workspace/models/t5_tokenizer"
@@ -142,7 +142,7 @@ no_browser: true
 YAML
 
 RUN chmod +x ${APP_DIR}/docker/*.sh ${APP_DIR}/docker/*.py \
-    && ln -sf ${APP_DIR}/docker/download_models.py /usr/local/bin/download-anima-models \
+    && ln -sf ${APP_DIR}/docker/download_models_direct.py /usr/local/bin/download-anima-models \
     && ln -sf ${APP_DIR}/docker/preflight.py /usr/local/bin/validate-anima-training \
     && ln -sf ${APP_DIR}/docker/train-runpod.sh /usr/local/bin/train-runpod \
     && ${APP_DIR}/docker/runpod-self-test.sh
