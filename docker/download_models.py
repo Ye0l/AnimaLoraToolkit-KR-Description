@@ -9,6 +9,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors import safe_open
@@ -72,6 +73,64 @@ def is_valid_safetensors(path: Path) -> bool:
         return False
 
 
+def force_attempts() -> tuple[bool, ...]:
+    return (True,) if FORCE else (False, True)
+
+
+def download_file_validated(
+    *, repo_id: str, filename: str, revision: str, local_dir: Path
+) -> Path:
+    last_error: Exception | None = None
+    for force_download in force_attempts():
+        path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+                local_dir=local_dir,
+                force_download=force_download,
+                token=HF_TOKEN,
+            )
+        )
+        try:
+            validate_safetensors(path)
+            return path
+        except Exception as exc:
+            last_error = exc
+            print(f"WARNING: invalid cached download, retrying: {path}: {exc}")
+            path.unlink(missing_ok=True)
+    raise RuntimeError(f"Could not obtain a valid file: {repo_id}:{filename}: {last_error}")
+
+
+def snapshot_validated(
+    *,
+    repo_id: str,
+    revision: str,
+    local_dir: Path,
+    allow_patterns: list[str],
+    validator: Callable[[Path], None],
+) -> Path:
+    last_error: Exception | None = None
+    for force_download in force_attempts():
+        path = Path(
+            snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                local_dir=local_dir,
+                allow_patterns=allow_patterns,
+                force_download=force_download,
+                token=HF_TOKEN,
+            )
+        )
+        try:
+            validator(path)
+            return path
+        except Exception as exc:
+            last_error = exc
+            print(f"WARNING: invalid local snapshot, retrying with force: {path}: {exc}")
+    raise RuntimeError(f"Could not obtain a valid snapshot: {repo_id}: {last_error}")
+
+
 def atomic_symlink(target: Path, link: Path) -> None:
     target = target.resolve(strict=True)
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -111,50 +170,46 @@ def prepare_anima() -> None:
 
     anima_store = MODEL_DIR / ".anima-source"
     if need_transformer:
-        source = Path(
-            hf_hub_download(
-                repo_id=ANIMA_REPO,
-                filename=ANIMA_FILE,
-                revision=ANIMA_REVISION,
-                local_dir=anima_store,
-                force_download=FORCE,
-                token=HF_TOKEN,
-            )
+        source = download_file_validated(
+            repo_id=ANIMA_REPO,
+            filename=ANIMA_FILE,
+            revision=ANIMA_REVISION,
+            local_dir=anima_store,
         )
-        validate_safetensors(source)
         atomic_symlink(source, transformer)
 
     if need_vae:
-        source = Path(
-            hf_hub_download(
-                repo_id=ANIMA_REPO,
-                filename="split_files/vae/qwen_image_vae.safetensors",
-                revision=ANIMA_REVISION,
-                local_dir=anima_store,
-                force_download=FORCE,
-                token=HF_TOKEN,
-            )
+        source = download_file_validated(
+            repo_id=ANIMA_REPO,
+            filename="split_files/vae/qwen_image_vae.safetensors",
+            revision=ANIMA_REVISION,
+            local_dir=anima_store,
         )
-        validate_safetensors(source)
         atomic_symlink(source, vae)
+
+
+def validate_qwen(target: Path) -> None:
+    for name in ("config.json", "model.safetensors", "tokenizer_config.json"):
+        validate_nonempty(target / name)
+    validate_safetensors(target / "model.safetensors")
+    tokenizer_ok = is_valid_file(target / "tokenizer.json") or (
+        is_valid_file(target / "vocab.json") and is_valid_file(target / "merges.txt")
+    )
+    if not tokenizer_ok:
+        raise RuntimeError(f"Qwen tokenizer files are incomplete under {target}")
 
 
 def prepare_qwen() -> None:
     target = MODEL_DIR / "text_encoders"
-    required = [
-        target / "config.json",
-        target / "model.safetensors",
-        target / "tokenizer_config.json",
-    ]
-    tokenizer_ok = is_valid_file(target / "tokenizer.json") or (
-        is_valid_file(target / "vocab.json") and is_valid_file(target / "merges.txt")
-    )
-    if not FORCE and all(is_valid_file(path) for path in required) and tokenizer_ok:
-        if is_valid_safetensors(target / "model.safetensors"):
+    if not FORCE:
+        try:
+            validate_qwen(target)
             print(f"[skip] {target}")
             return
+        except Exception:
+            pass
 
-    snapshot_download(
+    snapshot_validated(
         repo_id=QWEN_REPO,
         revision=QWEN_REVISION,
         local_dir=target,
@@ -167,32 +222,27 @@ def prepare_qwen() -> None:
             "vocab.json",
             "merges.txt",
         ],
-        force_download=FORCE,
-        token=HF_TOKEN,
+        validator=validate_qwen,
     )
-    for path in required:
-        validate_nonempty(path)
-    validate_safetensors(target / "model.safetensors")
-    tokenizer_ok = is_valid_file(target / "tokenizer.json") or (
-        is_valid_file(target / "vocab.json") and is_valid_file(target / "merges.txt")
-    )
-    if not tokenizer_ok:
-        raise RuntimeError(f"Qwen tokenizer files are incomplete under {target}")
     print(f"[ready] {target}")
+
+
+def validate_t5(target: Path) -> None:
+    for name in ("spiece.model", "tokenizer_config.json", "special_tokens_map.json"):
+        validate_nonempty(target / name)
 
 
 def prepare_t5() -> None:
     target = MODEL_DIR / "t5_tokenizer"
-    required = [
-        target / "spiece.model",
-        target / "tokenizer_config.json",
-        target / "special_tokens_map.json",
-    ]
-    if not FORCE and all(is_valid_file(path) for path in required):
-        print(f"[skip] {target}")
-        return
+    if not FORCE:
+        try:
+            validate_t5(target)
+            print(f"[skip] {target}")
+            return
+        except Exception:
+            pass
 
-    snapshot_download(
+    snapshot_validated(
         repo_id=T5_REPO,
         revision=T5_REVISION,
         local_dir=target,
@@ -201,11 +251,8 @@ def prepare_t5() -> None:
             "tokenizer_config.json",
             "special_tokens_map.json",
         ],
-        force_download=FORCE,
-        token=HF_TOKEN,
+        validator=validate_t5,
     )
-    for path in required:
-        validate_nonempty(path)
     print(f"[ready] {target}")
 
 
