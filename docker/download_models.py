@@ -85,9 +85,6 @@ def atomic_symlink(target: Path, link: Path) -> None:
             pass
         link.unlink()
     elif link.exists():
-        if link.is_file() and link.stat().st_size > 0 and not FORCE:
-            print(f"[skip:user-file] {link}")
-            return
         if link.is_dir():
             raise RuntimeError(f"Expected a file but found a directory: {link}")
         link.unlink()
@@ -230,6 +227,12 @@ def self_test() -> None:
         atomic_symlink(source, link)
         if link.read_bytes() != b"test\n":
             raise RuntimeError("atomic symlink self-test failed")
+
+        damaged = root / "damaged.bin"
+        damaged.write_bytes(b"damaged")
+        atomic_symlink(source, damaged)
+        if not damaged.is_symlink() or damaged.read_bytes() != b"test\n":
+            raise RuntimeError("damaged destination replacement self-test failed")
     print("download_models self-test: OK")
 
 
