@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import torch
 import yaml
 from PIL import Image
 from safetensors import safe_open
+from transformers import AutoConfig, AutoTokenizer, T5Tokenizer
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -105,6 +107,13 @@ def validate_models(config: dict) -> None:
     for name in ("spiece.model", "tokenizer_config.json", "special_tokens_map.json"):
         require_nonempty(t5 / name, f"T5 tokenizer {name}")
 
+    try:
+        AutoConfig.from_pretrained(qwen, local_files_only=True)
+        AutoTokenizer.from_pretrained(qwen, local_files_only=True)
+        T5Tokenizer.from_pretrained(t5, local_files_only=True)
+    except Exception as exc:
+        fail(f"local tokenizer/config load failed: {exc}")
+
 
 def caption_for(image: Path, prefer_json: bool) -> Path | None:
     if prefer_json and image.with_suffix(".json").is_file():
@@ -114,6 +123,16 @@ def caption_for(image: Path, prefer_json: bool) -> Path | None:
         if candidate.is_file():
             return candidate
     return None
+
+
+def validate_caption(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError("empty caption")
+    if path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        if not isinstance(payload, (dict, list, str)):
+            raise ValueError("unsupported JSON caption root")
 
 
 def validate_dataset(config: dict) -> tuple[int, int]:
@@ -146,9 +165,7 @@ def validate_dataset(config: dict) -> tuple[int, int]:
         except Exception as exc:
             corrupt.append(f"{image}: {exc}")
         try:
-            text = caption.read_text(encoding="utf-8")
-            if not text.strip():
-                corrupt.append(f"{caption}: empty caption")
+            validate_caption(caption)
         except Exception as exc:
             corrupt.append(f"{caption}: {exc}")
     if corrupt:
