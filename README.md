@@ -1,911 +1,496 @@
-# AnimaLoraToolkit 한국어 가이드
+# AnimaLoraToolkit RunPod 한국어 가이드
 
-이 저장소는 [Moeblack/AnimaLoraToolkit](https://github.com/Moeblack/AnimaLoraToolkit)을 기반으로 한 포크입니다.
+이 저장소는 `Moeblack/AnimaLoraToolkit` 기반의 Anima LoRA 학습 도구와 RunPod용 Docker 이미지를 제공합니다.
 
-원본 코드의 중국어 README 대신, **RunPod에서 Anima 단일 캐릭터 LoRA를 실제로 학습하면서 확인한 설치 과정과 오류 해결 방법**을 한국어로 정리했습니다.
+이 문서는 **현재 `master` 브랜치의 Dockerfile과 `docker/` 스크립트 기준**입니다. 예전 수동 설치 방식과 현재 Docker 실행 방식을 섞지 않습니다.
 
-> 이 문서는 2026-06-26 기준으로 작성되었습니다. 원본 프로젝트가 업데이트되면 일부 설정명이나 의존성이 달라질 수 있습니다.
+## 현재 구성
 
----
-
-## 검증한 환경
-
-- RunPod
-- NVIDIA RTX 3090 24GB
-- Ubuntu 24.04 계열 컨테이너
+- Ubuntu 24.04
 - Python 3.12
-- PyTorch 2.8.0 + CUDA 12.8
-- 데이터셋 224장
-- 모든 이미지 1024×1024 PNG
-- 이미지와 같은 이름의 TXT 캡션 사용
-- 단일 캐릭터 LoRA
-- LoRA rank 32
+- PyTorch 2.8.0
+- CUDA 12.8
+- SSH 서버
+- 데이터셋 업로드 Web UI
+- 시작 시 모델 자동 다운로드
+- 학습 전 모델·데이터셋·CUDA 검사
+- Rich 진행 화면과 로그 동시 저장
 
-실제 측정값은 대략 다음과 같았습니다.
+컨테이너 이미지는 다음 경로로 빌드됩니다.
 
-- `batch_size: 1`, `grad_accum: 4`
-- 약 `0.16 it/s`
-- VRAM 약 11GB 사용
-- GPU 사용률 100%
+```text
+ghcr.io/ye0l/animaloratoolkit-kr-description:latest
+```
 
-VRAM 사용량이 낮아 보여도 `cache_latents`, BF16, gradient checkpointing, LoRA 학습 구조 때문에 정상일 수 있습니다.
+GitHub Actions의 `Build RunPod image` 작업이 성공한 뒤 생성된 `latest`를 사용해야 합니다.
 
 ---
 
-## ComfyUI가 필요한가?
+## 디렉터리 구조
 
-필요하지 않습니다.
+```text
+/opt/AnimaLoraToolkit/                 Docker 이미지에 포함된 프로그램 코드
+├── anima_train.py
+├── config/runpod-docker.yaml          이미지 기본 학습 설정
+└── docker/                            RunPod 실행 스크립트
 
-AnimaLoraToolkit은 독립적으로 학습할 수 있습니다. ComfyUI는 학습이 끝난 `.safetensors` LoRA를 나중에 테스트하거나 사용할 때만 필요합니다.
+/workspace/                            RunPod 영구 볼륨
+├── models/                            시작 시 받은 모델
+│   ├── transformers/
+│   │   └── anima-preview.safetensors
+│   ├── vae/
+│   │   └── qwen_image_vae.safetensors
+│   ├── text_encoders/                 Qwen3-0.6B-Base
+│   ├── t5_tokenizer/                  T5 v1.1 XXL tokenizer
+│   └── .downloads/                    다운로드 중 사용하는 임시 공간
+├── dataset/                           학습 이미지와 캡션
+├── output/                            LoRA, 샘플, 학습 상태
+├── logs/                              학습 및 업로드 서버 로그
+└── my_character.yaml                  사용자가 복사해 수정하는 설정 예시
+```
+
+`/opt`는 이미지 코드이고 `/workspace`는 영구 데이터입니다. 팟을 중지하거나 이미지를 교체할 때 보존해야 하는 모델, 데이터셋, 결과물은 모두 `/workspace`에 둡니다.
 
 ---
 
-## 전체 과정
+# 1. RunPod Template 설정
 
-1. RunPod 생성
-2. 저장소 clone
-3. Python 가상환경 및 의존성 설치
-4. Anima, VAE, Qwen3, T5 tokenizer 준비
-5. 이미지와 TXT 캡션 준비
-6. 데이터셋과 모델 검증
-7. YAML 설정 작성
-8. smoke test
-9. 본 학습
-10. 결과 LoRA 확인
-
----
-
-# 1. 저장소 설치
-
-```bash
-cd /workspace
-
-git clone https://github.com/Ye0l/AnimaLoraToolkit-KR-Description.git
-cd AnimaLoraToolkit-KR-Description
-```
-
-RunPod의 CUDA PyTorch를 그대로 쓰기 위해 `--system-site-packages`를 사용합니다.
-
-```bash
-python -m venv .venv --system-site-packages
-source .venv/bin/activate
-
-python -m pip install --upgrade pip setuptools wheel
-```
-
-## `pillow-jxlpy` 설치 오류 우회
-
-현재 `requirements.txt`에는 다음 항목이 있습니다.
+## 이미지
 
 ```text
-pillow-jxlpy>=0.9.0
+ghcr.io/ye0l/animaloratoolkit-kr-description:latest
 ```
 
-일부 Python 3.12 Linux 환경에서는 다음 오류가 발생합니다.
+## 포트
+
+RunPod Template에서 다음 포트를 노출합니다.
 
 ```text
-ERROR: Could not find a version that satisfies the requirement pillow-jxlpy>=0.9.0
-ERROR: No matching distribution found for pillow-jxlpy>=0.9.0
+TCP  22
+HTTP 7860
 ```
 
-PNG, JPG, WebP만 학습한다면 JPEG XL 지원은 필요하지 않으므로 해당 줄을 제외하고 설치할 수 있습니다.
+- `22`: SSH
+- `7860`: 파일 업로드 Web UI
 
-```bash
-grep -v 'pillow-jxlpy' requirements.txt > requirements.runpod.txt
-python -m pip install -r requirements.runpod.txt
-```
-
-T5 tokenizer 검증에 필요한 패키지도 설치합니다.
-
-```bash
-python -m pip install \
-  sentencepiece \
-  tiktoken \
-  protobuf \
-  huggingface_hub
-```
-
-설치 상태 확인:
-
-```bash
-python -m pip check
-
-python - <<'PY'
-import torch
-import sentencepiece
-import tiktoken
-import google.protobuf
-
-print("torch:", torch.__version__)
-print("torch CUDA:", torch.version.cuda)
-print("CUDA available:", torch.cuda.is_available())
-print("sentencepiece:", sentencepiece.__version__)
-print("tiktoken:", tiktoken.__version__)
-print("protobuf:", google.protobuf.__version__)
-
-if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-PY
-```
-
-정상이라면 다음이 포함되어야 합니다.
+## 권장 환경 변수
 
 ```text
-CUDA available: True
-GPU: NVIDIA GeForce RTX 3090
+WEBUI_USER=runpod
+WEBUI_PASSWORD=충분히_긴_비밀번호
+```
+
+RunPod 계정에 SSH 공개키를 등록하면 보통 `PUBLIC_KEY` 환경 변수가 자동으로 전달됩니다. 직접 넣을 때는 다음 변수도 지원합니다.
+
+```text
+SSH_PUBLIC_KEY=ssh-ed25519 AAAA...
+```
+
+기본 동작을 바꾸는 변수:
+
+```text
+AUTO_DOWNLOAD_MODELS=1
+SSH_ENABLED=1
+WEBUI_ENABLED=1
+WEBUI_PORT=7860
+UPLOAD_DIR=/workspace/dataset
+```
+
+모델 자동 다운로드를 끄려면:
+
+```text
+AUTO_DOWNLOAD_MODELS=0
 ```
 
 ---
 
-# 2. 모델 파일 준비
+# 2. 컨테이너 시작 동작
 
-필요한 구성은 다음과 같습니다.
-
-```text
-models/
-├── transformers/
-│   └── anima.safetensors
-├── vae/
-│   └── qwen_image_vae.safetensors
-├── text_encoders/
-│   ├── config.json
-│   ├── model.safetensors
-│   ├── tokenizer.json
-│   ├── tokenizer_config.json
-│   ├── vocab.json
-│   └── merges.txt
-└── t5_tokenizer/
-    ├── spiece.model
-    ├── tokenizer_config.json
-    └── special_tokens_map.json
-```
-
-## Anima와 VAE
-
-다음 저장소에서 받습니다.
-
-- [circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima)
-
-예시 경로:
+컨테이너는 다음 순서로 시작합니다.
 
 ```text
-models/transformers/anima.safetensors
-models/vae/qwen_image_vae.safetensors
+/workspace 디렉터리 생성
+→ SSH 서버 시작
+→ 업로드 Web UI 시작
+→ 모델 존재 여부와 무결성 검사
+→ 없거나 손상된 모델 다운로드
+→ sleep infinity로 컨테이너 유지
 ```
 
-Anima 파일명은 반드시 `anima-preview.safetensors`일 필요가 없습니다.
+학습은 자동으로 시작하지 않습니다.
 
-파일명이 `anima.safetensors`라면 설정 파일도 다음처럼 맞추면 됩니다.
+시작 로그에서 다음과 비슷한 메시지를 확인할 수 있습니다.
 
-```yaml
-transformer_path: "models/transformers/anima.safetensors"
+```text
+SSH server started on container port 22.
+Upload Web UI started: port=7860 path=/upload directory=/workspace/dataset
+Model preparation complete: /workspace/models
 ```
 
-## Qwen3-0.6B-Base
-
-Qwen 모델은 ComfyUI용 단일 text encoder 파일이 아니라 Hugging Face 디렉터리 형식이 필요합니다.
-
-```bash
-mkdir -p models/text_encoders
-
-hf download Qwen/Qwen3-0.6B-Base \
-  model.safetensors \
-  config.json \
-  tokenizer.json \
-  tokenizer_config.json \
-  vocab.json \
-  merges.txt \
-  --local-dir models/text_encoders
-```
-
-Qwen3 공식 저장소에는 `special_tokens_map.json`이 없을 수 있습니다. 없어도 `AutoTokenizer.from_pretrained()`가 정상적으로 로드된다면 문제없습니다.
-
-다른 모델의 `special_tokens_map.json`을 임의로 복사하지 마십시오.
-
-## T5 tokenizer
-
-RunPod에서는 Hugging Face 공식 주소를 사용합니다.
-
-```bash
-python download_tokenizers.py --no-mirror
-```
-
-이 스크립트는 tokenizer 파일을 내려받습니다. Anima, VAE, Qwen3 모델 가중치는 별도로 준비해야 합니다.
+모델 다운로드가 실패해도 SSH와 Web UI는 계속 실행됩니다.
 
 ---
 
-# 3. 모델 검증
+# 3. 모델 다운로드
+
+기본적으로 다음 Hugging Face 저장소를 사용합니다.
+
+```text
+circlestone-labs/Anima
+Qwen/Qwen3-0.6B-Base
+google/t5-v1_1-xxl
+```
+
+Anima에서 받는 파일:
+
+```text
+split_files/diffusion_models/anima-preview.safetensors
+split_files/vae/qwen_image_vae.safetensors
+```
+
+최종 저장 위치:
+
+```text
+/workspace/models/transformers/anima-preview.safetensors
+/workspace/models/vae/qwen_image_vae.safetensors
+/workspace/models/text_encoders/
+/workspace/models/t5_tokenizer/
+```
+
+현재 다운로더는 최종 모델 경로에 일반 파일을 저장합니다. 최종 Anima와 VAE 파일을 Hugging Face 캐시로 연결하는 심볼릭 링크 방식은 사용하지 않습니다.
+
+수동 실행:
 
 ```bash
-source .venv/bin/activate
-python validate_local_models.py
+download-anima-models
 ```
 
-정상 결과:
+정상 파일이 이미 있으면 다음처럼 건너뜁니다.
 
 ```text
-[PASS] T5 Tokenizer
-[PASS] Qwen Tokenizer
-[PASS] Qwen Model
-[PASS] Encode Workflow
+[skip] /workspace/models/transformers/anima-preview.safetensors
+[skip] /workspace/models/vae/qwen_image_vae.safetensors
+[skip] /workspace/models/text_encoders
+[skip] /workspace/models/t5_tokenizer
 ```
 
-## T5 tokenizer 오류
-
-### `sentencepiece`가 없다는 오류
-
-```text
-SentencePieceExtractor requires the SentencePiece library
-```
-
-해결:
+다시 받으려면 한 번만 환경 변수를 붙입니다.
 
 ```bash
-python -m pip install sentencepiece tiktoken
+FORCE_DOWNLOAD=1 download-anima-models
 ```
 
-### `protobuf`가 없다는 오류
-
-```text
-SentencePieceExtractor requires the protobuf library
-```
-
-해결:
+기존 이미지에서 생성된 깨진 링크가 남아 있으면 확인 후 삭제할 수 있습니다.
 
 ```bash
-python -m pip install protobuf
+find -L /workspace/models -type l -print
+find -L /workspace/models -type l -delete
 ```
 
-이때 함께 나타나는 다음 오류는 `protobuf` 경로가 실패한 뒤 tiktoken fallback이 바이너리 `spiece.model`을 잘못 읽어서 발생한 2차 오류입니다.
+다운로드 저장소를 바꾸는 환경 변수:
 
 ```text
-Error parsing line ... spiece.model
+ANIMA_REPO
+ANIMA_REVISION
+ANIMA_FILE
+QWEN_REPO
+QWEN_REVISION
+T5_REPO
+T5_REVISION
+HF_TOKEN
 ```
-
-`protobuf`, `sentencepiece`, `tiktoken`을 모두 설치한 뒤 다시 검증하면 됩니다.
 
 ---
 
-# 4. 데이터셋 준비
+# 4. 데이터셋 업로드
 
-예시:
+브라우저에서 다음 주소를 엽니다.
 
 ```text
-/workspace/anima-dataset/
+https://<POD_ID>-7860.proxy.runpod.net/upload
+```
+
+기본 업로드 위치:
+
+```text
+/workspace/dataset
+```
+
+이미지와 캡션의 파일명이 같아야 합니다.
+
+```text
+/workspace/dataset/
 ├── 001.png
 ├── 001.txt
-├── 002.png
+├── 002.webp
 ├── 002.txt
 └── ...
 ```
 
-이미지와 캡션 파일의 stem이 같아야 합니다.
+기본 설정은 TXT 캡션을 사용합니다.
 
 ```text
-001.png ↔ 001.txt
+my_trigger, 1girl, solo, long hair, looking at viewer
 ```
 
-## TXT 캡션 예시
+지원 이미지 확장자:
 
 ```text
-my_trigger, 1girl, solo, long hair, black hair, blue eyes, looking at viewer
+.jpg .jpeg .png .webp .bmp
 ```
 
-트리거 태그를 모든 캡션의 첫 번째에 두면 다음 설정을 사용할 수 있습니다.
-
-```yaml
-shuffle_caption: true
-keep_tokens: 1
-```
-
-캡션이 다음처럼 시작한다면:
+지원 캡션:
 
 ```text
-safe, 1girl, my_trigger, solo, ...
+.txt
+.caption
+.json  # prefer_json: true일 때
 ```
 
-앞의 세 태그를 고정하려면:
+업로드 서버 로그:
 
-```yaml
-keep_tokens: 3
+```text
+/workspace/logs/uploadserver.log
 ```
-
-## 품질 태그
-
-`best quality`, `masterpiece`, `score_7` 같은 품질 태그는 필수가 아닙니다.
-
-단일 캐릭터 데이터가 이미 일정한 품질로 선별되어 있다면 품질 태그 없이 학습해도 됩니다. 잘못된 품질 태그를 모든 이미지에 일괄 삽입하는 것보다 생략하는 편이 낫습니다.
 
 ---
 
-# 5. 데이터셋 검증
+# 5. SSH 접속
 
-이미지와 TXT 수 확인:
-
-```bash
-cd /workspace
-
-echo "PNG:"
-find anima-dataset -maxdepth 1 -type f -iname '*.png' | wc -l
-
-echo "TXT:"
-find anima-dataset -maxdepth 1 -type f -iname '*.txt' | wc -l
-```
-
-파일 대응 확인:
+RunPod의 Connect 화면에 표시된 주소와 외부 포트를 사용합니다.
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-
-root = Path("/workspace/anima-dataset")
-
-images = {p.stem for p in root.glob("*.png")}
-captions = {p.stem for p in root.glob("*.txt")}
-
-print("PNG:", len(images))
-print("TXT:", len(captions))
-print("캡션 누락:", sorted(images - captions))
-print("이미지 누락:", sorted(captions - images))
-
-empty = [
-    str(p) for p in root.glob("*.txt")
-    if not p.read_text(encoding="utf-8").strip()
-]
-print("빈 캡션:", empty)
-PY
+ssh root@<PUBLIC_IP> -p <EXTERNAL_SSH_PORT>
 ```
+
+컨테이너 내부 SSH 포트는 `22`입니다. RunPod가 외부 포트를 별도로 할당할 수 있으므로 무조건 `-p 22`를 쓰면 안 됩니다.
+
+SSH 상태 확인:
+
+```bash
+pgrep -a sshd
+ss -lntp | grep ':22'
+```
+
+공개키 확인:
+
+```bash
+cat /root/.ssh/authorized_keys
+```
+
+---
+
+# 6. 학습 설정 만들기
+
+이미지 기본 설정은 다음 위치에 있습니다.
+
+```text
+/opt/AnimaLoraToolkit/config/runpod-docker.yaml
+```
+
+직접 수정하지 말고 `/workspace`에 복사합니다.
+
+```bash
+cp /opt/AnimaLoraToolkit/config/runpod-docker.yaml \
+   /workspace/my_character.yaml
+```
+
+최소한 다음 항목을 수정합니다.
+
+```yaml
+output_name: "my-character-anima"
+sample_prompt: "newest, safe, 1girl, my_trigger, solo, portrait, looking at viewer"
+```
+
+기본 모델 경로는 다음과 일치해야 합니다.
+
+```yaml
+transformer_path: "/workspace/models/transformers/anima-preview.safetensors"
+vae_path: "/workspace/models/vae/qwen_image_vae.safetensors"
+text_encoder_path: "/workspace/models/text_encoders"
+t5_tokenizer_path: "/workspace/models/t5_tokenizer"
+```
+
+기본 데이터 및 출력 경로:
+
+```yaml
+data_dir: "/workspace/dataset"
+output_dir: "/workspace/output"
+```
+
+RTX 3090 24GB에서 사용한 기본 학습값:
+
+```yaml
+resolution: 1024
+repeats: 2
+batch_size: 2
+grad_accum: 2
+mixed_precision: "bf16"
+grad_checkpoint: true
+cache_latents: true
+lora_type: "lora"
+lora_rank: 32
+lora_alpha: 32.0
+epochs: 10
+save_every_steps: 200
+```
+
+---
+
+# 7. 학습 전 검사
+
+설정과 데이터가 준비되면 직접 검사할 수 있습니다.
+
+```bash
+validate-anima-training /workspace/my_character.yaml
+```
+
+검사 항목:
+
+- YAML 필수 키와 숫자 범위
+- 해상도가 64의 배수인지
+- Anima, VAE, Qwen safetensors가 열리는지
+- Qwen과 T5 tokenizer가 로컬에서 로드되는지
+- CUDA와 BF16 지원 여부
+- 이미지 파일 손상 여부
+- 이미지와 캡션 짝
+- 빈 캡션과 잘못된 JSON
+- 출력 디렉터리 쓰기 가능 여부
 
 정상 예시:
 
 ```text
-PNG: 224
-TXT: 224
-캡션 누락: []
-이미지 누락: []
-빈 캡션: []
-```
-
-이미지 무결성과 해상도 확인:
-
-```bash
-python - <<'PY'
-from pathlib import Path
-from PIL import Image
-
-root = Path("/workspace/anima-dataset")
-errors = []
-sizes = []
-
-for path in root.glob("*.png"):
-    try:
-        with Image.open(path) as image:
-            image.verify()
-
-        with Image.open(path) as image:
-            sizes.append((image.width, image.height, path.name))
-    except Exception as e:
-        errors.append((path.name, str(e)))
-
-print("valid:", len(sizes))
-print("errors:", len(errors))
-
-for item in errors:
-    print("ERROR:", item)
-
-if sizes:
-    widths = [x[0] for x in sizes]
-    heights = [x[1] for x in sizes]
-
-    print("width range:", min(widths), "~", max(widths))
-    print("height range:", min(heights), "~", max(heights))
-
-    small = [x for x in sizes if min(x[0], x[1]) < 512]
-    print("short side below 512:", len(small))
-PY
-```
-
-이 문서에서 사용한 데이터셋 결과:
-
-```text
-valid: 224
-errors: 0
-width range: 1024 ~ 1024
-height range: 1024 ~ 1024
-short side below 512: 0
+Training preflight OK: pairs=224, skipped=0, batch=2x2, resolution=1024
 ```
 
 ---
 
-# 6. RTX 3090용 설정 파일
-
-다음 파일을 생성합니다.
+# 8. 학습 실행
 
 ```bash
-cd /workspace/AnimaLoraToolkit-KR-Description
-source .venv/bin/activate
+TRAIN_CONFIG=/workspace/my_character.yaml train-runpod
+```
 
-cat > config/my_character.yaml <<'YAML'
-# 모델
-transformer_path: "models/transformers/anima.safetensors"
-vae_path: "models/vae/qwen_image_vae.safetensors"
-text_encoder_path: "models/text_encoders"
-t5_tokenizer_path: "models/t5_tokenizer"
+`train-runpod`은 다음을 자동 수행합니다.
 
-# 데이터
-# 실제 데이터셋 경로로 변경
-data_dir: "/workspace/anima-dataset"
-resolution: 1024
+```text
+모델 확인 및 누락 파일 다운로드
+→ 학습 전 검사
+→ anima_train.py 실행
+→ Rich 진행 화면 표시
+→ 동일 출력을 로그에 저장
+```
 
-# 224장 기준
-repeats: 2
+로그 위치:
 
-# TXT 캡션
-prefer_json: false
-shuffle_caption: true
+```text
+/workspace/logs/anima-training-YYYYMMDD-HHMMSS.log
+```
 
-# 첫 번째 태그가 트리거일 때 1
-keep_tokens: 1
+결과 위치:
 
-# 좌우 비대칭 특성이 있을 수 있으므로 기본 비활성
-flip_augment: false
+```text
+/workspace/output
+```
 
-tag_dropout: 0.05
-cache_latents: true
+`train-runpod` 실행 시 모델 확인을 생략하려면:
 
-# LoRA
-lora_type: "lora"
-lora_rank: 32
-lora_alpha: 32.0
-lokr_factor: 8
+```bash
+DOWNLOAD_MODELS_ON_TRAIN=0 \
+TRAIN_CONFIG=/workspace/my_character.yaml \
+train-runpod
+```
+
+Rich 진행 화면을 유지하려면 `tee`로 다시 파이프하지 마십시오. `train-runpod`이 내부에서 pseudo-TTY와 로그 저장을 처리합니다.
+
+---
+
+# 9. 재시작 시 동작
+
+컨테이너를 재시작하면:
+
+- `/workspace`의 모델, 데이터셋, 출력, 로그는 유지됩니다.
+- SSH와 Web UI가 다시 시작됩니다.
+- 모델 파일을 검사합니다.
+- 정상 모델은 다시 받지 않습니다.
+- 손상되거나 비어 있는 모델은 다시 받습니다.
+- 학습은 자동 재개되지 않습니다.
+
+학습 상태를 저장하고 재개하려면 YAML의 다음 값을 사용합니다.
+
+```yaml
+save_state_every: 1000
+resume_state: "/workspace/output/<state-file>.pt"
+```
+
+---
+
+# 10. 자주 쓰는 확인 명령
+
+모델 파일:
+
+```bash
+find /workspace/models -maxdepth 2 -type f -printf '%12s  %p\n' | sort -n
+```
+
+깨진 링크:
+
+```bash
+find -L /workspace/models -type l -print
+```
+
+GPU 프로세스:
+
+```bash
+nvidia-smi
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+실행 서비스:
+
+```bash
+pgrep -a -f 'sshd|uploadserver|anima_train'
+```
+
+업로드 UI 로그:
+
+```bash
+tail -n 100 /workspace/logs/uploadserver.log
+```
+
+최신 학습 로그:
+
+```bash
+ls -1t /workspace/logs/anima-training-*.log | head -n 1
+```
+
+---
+
+## 핵심 명령 요약
+
+```bash
+# 모델 준비
+download-anima-models
+
+# 설정 복사
+cp /opt/AnimaLoraToolkit/config/runpod-docker.yaml \
+   /workspace/my_character.yaml
+
+# 사전 검사
+validate-anima-training /workspace/my_character.yaml
 
 # 학습
-epochs: 10
-max_steps: 0
-
-batch_size: 1
-grad_accum: 4
-learning_rate: 1.0e-4
-
-mixed_precision: "bf16"
-grad_checkpoint: true
-xformers: false
-num_workers: 0
-
-# 출력
-output_dir: "/workspace/anima-output"
-output_name: "my-character-anima"
-
-save_every: 0
-save_every_steps: 200
-save_state_every: 1000
-
-seed: 42
-
-# 중간 샘플은 우선 비활성
-sample_every: 0
-sample_steps: 0
-
-sample_infer_steps: 25
-sample_cfg_scale: 4.0
-sample_sampler_name: "er_sde"
-sample_scheduler: "simple"
-sample_width: 0
-sample_height: 0
-sample_seed: 42
-sample_negative_prompt: ""
-
-# YOUR_TRIGGER를 실제 트리거로 변경
-sample_prompt: "newest, safe, 1girl, YOUR_TRIGGER, solo, portrait, looking at viewer"
-
-# 진행 표시
-loss_curve_steps: 100
-no_progress: false
-log_every: 10
-YAML
+TRAIN_CONFIG=/workspace/my_character.yaml train-runpod
 ```
 
-트리거와 출력명을 변경합니다.
-
-```bash
-sed -i 's/YOUR_TRIGGER/my_trigger/g' config/my_character.yaml
-sed -i 's/my-character-anima/my_trigger-anima/g' config/my_character.yaml
-```
-
-경로 검사:
-
-```bash
-python - <<'PY'
-from pathlib import Path
-import yaml
-
-config_path = Path("config/my_character.yaml")
-config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-
-for key in [
-    "transformer_path",
-    "vae_path",
-    "text_encoder_path",
-    "t5_tokenizer_path",
-    "data_dir",
-]:
-    path = Path(config[key])
-    if not path.is_absolute():
-        path = Path.cwd() / path
-
-    print(f"{key:22} {'OK' if path.exists() else 'MISSING'}  {path}")
-PY
-```
-
-모든 항목이 `OK`여야 합니다.
-
----
-
-# 7. 예상 step 수
-
-현재 예시 설정:
+현재 Docker 실행 기준에서 사용하는 파일은 다음입니다.
 
 ```text
-224장 × repeats 2 × epochs 10 ÷ effective batch 4
-= 약 1120 optimizer step
+Dockerfile
+docker/entrypoint.sh
+docker/download_models_direct.py
+docker/preflight.py
+docker/train-runpod.sh
+docker/runpod-self-test.sh
+.github/workflows/docker-runpod.yml
 ```
-
-```text
-effective batch = batch_size × grad_accum
-```
-
-현재 설정:
-
-```text
-1 × 4 = 4
-```
-
-`batch_size: 2`, `grad_accum: 2`로 바꿔도 effective batch는 동일하므로 총 step 수는 그대로입니다.
-
-```text
-2 × 2 = 4
-```
-
----
-
-# 8. Smoke test
-
-본 학습 전에 1 epoch만 실행해 모델 로딩, latent cache, backward, 저장이 정상인지 확인합니다.
-
-```bash
-cp config/my_character.yaml config/smoke_test.yaml
-
-python - <<'PY'
-from pathlib import Path
-import yaml
-
-path = Path("config/smoke_test.yaml")
-config = yaml.safe_load(path.read_text(encoding="utf-8"))
-
-config["epochs"] = 1
-config["repeats"] = 1
-config["output_dir"] = "/workspace/anima-smoke-output"
-config["output_name"] = "smoke-test"
-config["save_every"] = 1
-config["save_every_steps"] = 0
-config["save_state_every"] = 0
-config["sample_every"] = 0
-config["sample_steps"] = 0
-
-path.write_text(
-    yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-    encoding="utf-8",
-)
-PY
-```
-
-실행:
-
-```bash
-python anima_train.py \
-  --config config/smoke_test.yaml \
-  --no-monitor
-```
-
-정상적인 주요 로그:
-
-```text
-Transformer 로딩
-VAE 로딩
-텍스트 인코더 로딩
-LoRA 주입
-데이터셋 인식
-latent cache 확인 또는 생성
-학습 loop 진입
-safetensors 저장
-```
-
----
-
-# 9. 본 학습
-
-RunPod 터미널 연결이 끊겨도 유지하려면 `tmux`를 사용합니다.
-
-```bash
-apt-get update
-apt-get install -y tmux
-
-tmux new -s anima
-```
-
-`tmux` 안에서 실행:
-
-```bash
-cd /workspace/AnimaLoraToolkit-KR-Description
-source .venv/bin/activate
-
-mkdir -p /workspace/anima-output
-
-python anima_train.py \
-  --config config/my_character.yaml \
-  --no-monitor
-```
-
-세션 분리:
-
-```text
-Ctrl+B
-D
-```
-
-다시 접속:
-
-```bash
-tmux attach -t anima
-```
-
----
-
-# 10. 진행률이 보이지 않는 문제
-
-다음처럼 `tee`를 사용하면 tqdm 진행 표시가 보이지 않거나 같은 줄 갱신이 깨질 수 있습니다.
-
-```bash
-python anima_train.py \
-  --config config/my_character.yaml \
-  --no-monitor \
-  2>&1 | tee /workspace/anima-output/training.log
-```
-
-설정 파일은 다음이어야 합니다.
-
-```yaml
-no_progress: false
-log_every: 10
-```
-
-진행률을 가장 확실하게 보려면 `tee` 없이 실행합니다.
-
-```bash
-python anima_train.py \
-  --config config/my_character.yaml \
-  --no-monitor
-```
-
-로그도 남기고 TTY 진행 표시도 유지하려면 `script`를 사용할 수 있습니다.
-
-```bash
-script -q -f \
-  /workspace/anima-output/training.log \
-  -c 'python anima_train.py --config config/my_character.yaml --no-monitor'
-```
-
-이미 실행 중이고 진행률이 보이지 않을 때는 별도 터미널에서 GPU 상태를 확인합니다.
-
-```bash
-watch -n 1 nvidia-smi
-```
-
-프로세스 상태:
-
-```bash
-ps -eo pid,stat,pcpu,pmem,etime,cmd | grep '[a]nima_train.py'
-```
-
-출력 파일 확인:
-
-```bash
-watch -n 10 'find /workspace/anima-output -maxdepth 1 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %f\n" | sort'
-```
-
-GPU 사용률이 계속 90~100%이고 프로세스가 살아 있다면 학습 중일 가능성이 높습니다.
-
----
-
-# 11. 설정 파일을 수정했는데 적용되지 않는 경우
-
-YAML은 프로세스 시작 시 한 번만 읽습니다.
-
-이미 실행 중인 상태에서 `config/my_character.yaml`을 수정해도 현재 프로세스에는 반영되지 않습니다.
-
-실행 중인 명령 확인:
-
-```bash
-ps -ef | grep '[a]nima_train.py'
-```
-
-실제 설정 확인:
-
-```bash
-grep -E '^(batch_size|grad_accum|grad_checkpoint|repeats|epochs):' \
-  config/my_character.yaml
-```
-
-변경값을 적용하려면 현재 학습을 안전하게 중단한 뒤 다시 실행해야 합니다.
-
----
-
-# 12. VRAM과 batch 설정
-
-RTX 3090에서 다음 설정은 안전한 출발점입니다.
-
-```yaml
-batch_size: 1
-grad_accum: 4
-grad_checkpoint: true
-cache_latents: true
-mixed_precision: "bf16"
-```
-
-VRAM이 남는다면 다음 구성을 시험할 수 있습니다.
-
-```yaml
-batch_size: 2
-grad_accum: 2
-```
-
-effective batch는 동일합니다.
-
-```text
-기존: 1 × 4 = 4
-변경: 2 × 2 = 4
-```
-
-총 optimizer step 수가 같아도 정상입니다.
-
-배치를 바꿨을 때는 `it/s`만 비교하지 말고 **한 epoch가 실제로 끝나는 시간**을 비교해야 합니다.
-
-더 많은 VRAM을 활용하고 싶다면 별도로 다음 설정도 시험할 수 있습니다.
-
-```yaml
-grad_checkpoint: false
-```
-
-다만 VRAM 사용량이 크게 증가할 수 있으므로 smoke test로 먼저 확인해야 합니다.
-
----
-
-# 13. 예상 속도
-
-RTX 3090, 1024×1024, rank 32, batch 1, grad accumulation 4, gradient checkpointing 활성 상태에서 실제로 약 다음 속도가 확인되었습니다.
-
-```text
-0.16 it/s
-약 6.25초 / optimizer step
-```
-
-총 1120 step이라면 순수 학습 시간은 대략 2시간 전후입니다.
-
-모델 로딩, 캐시, 저장 시간을 포함하면 조금 더 걸릴 수 있습니다.
-
----
-
-# 14. 출력 파일
-
-예시:
-
-```text
-/workspace/anima-output/
-├── my_trigger-anima_step200.safetensors
-├── my_trigger-anima_step400.safetensors
-├── my_trigger-anima_step600.safetensors
-├── my_trigger-anima_step800.safetensors
-├── my_trigger-anima_step1000.safetensors
-├── my_trigger-anima.safetensors
-└── training_state_step1000.pt
-```
-
-- `*_stepN.safetensors`: 중간 LoRA
-- 최종 `.safetensors`: 최종 LoRA
-- `training_state_stepN.pt`: optimizer와 random state를 포함한 복구용 상태
-
-최종 epoch가 항상 가장 좋은 결과는 아닙니다. 같은 seed와 프롬프트로 중간 체크포인트도 비교하는 것이 좋습니다.
-
----
-
-# 15. 중단 및 재개
-
-## LoRA 가중치만 이어서 학습
-
-```yaml
-resume_lora: "/workspace/anima-output/my_trigger-anima_step1000.safetensors"
-```
-
-optimizer 상태는 초기화됩니다.
-
-## 전체 학습 상태 복구
-
-```yaml
-resume_state: "/workspace/anima-output/training_state_step1000.pt"
-```
-
-optimizer, random state, epoch, step, loss history를 복구합니다.
-
----
-
-# 16. 자주 발생한 문제
-
-## `pillow-jxlpy`를 찾을 수 없음
-
-```bash
-grep -v 'pillow-jxlpy' requirements.txt > requirements.runpod.txt
-python -m pip install -r requirements.runpod.txt
-```
-
-## T5 tokenizer가 sentencepiece를 찾지 못함
-
-```bash
-python -m pip install sentencepiece tiktoken protobuf
-```
-
-## Qwen `special_tokens_map.json`이 없음
-
-Qwen3-0.6B-Base에서는 없어도 정상일 수 있습니다. 실제 tokenizer 검증이 PASS라면 임의로 만들 필요가 없습니다.
-
-## Anima 모델이 MISSING으로 나옴
-
-실제 파일명과 YAML 경로를 맞춥니다.
-
-```yaml
-transformer_path: "models/transformers/anima.safetensors"
-```
-
-## GPU는 100%인데 진행 로그가 없음
-
-`tqdm` 출력이 `tee`나 비-TTY 환경에서 보이지 않는 경우가 있습니다. GPU 사용률, 프로세스 상태, 중간 저장 파일을 확인합니다.
-
-## VRAM을 11GB 정도만 사용함
-
-다음 기능 때문에 정상일 수 있습니다.
-
-- LoRA 파라미터만 학습
-- BF16
-- gradient checkpointing
-- latent cache
-- batch size 1
-
-VRAM을 꽉 채우는 것이 목표가 아니라, GPU 연산기가 계속 사용되는지가 더 중요합니다.
-
-## OOM
-
-```yaml
-batch_size: 1
-grad_accum: 4
-grad_checkpoint: true
-cache_latents: true
-mixed_precision: "bf16"
-sample_every: 0
-sample_steps: 0
-```
-
-그래도 부족하면:
-
-```yaml
-resolution: 768
-```
-
----
-
-# 원본 프로젝트
-
-- 원본 저장소: [Moeblack/AnimaLoraToolkit](https://github.com/Moeblack/AnimaLoraToolkit)
-- Anima 모델: [circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima)
-- Qwen3-0.6B-Base: [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)
-- T5 tokenizer: [google/t5-v1_1-xxl](https://huggingface.co/google/t5-v1_1-xxl)
-
-코드의 라이선스와 저작권은 원본 저장소의 조건을 따릅니다.
