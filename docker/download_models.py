@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare model files on the persistent RunPod volume.
-
-Downloads are idempotent and guarded by an advisory file lock. Large files stay
-under /workspace; the image itself contains no model weights.
-"""
+"""Prepare model files on the persistent RunPod volume safely and idempotently."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
-import json
 import os
 import tempfile
 from contextlib import contextmanager
@@ -61,6 +56,22 @@ def validate_safetensors(path: Path) -> None:
             raise RuntimeError(f"No tensors found in: {path}")
 
 
+def is_valid_file(path: Path) -> bool:
+    try:
+        validate_nonempty(path)
+        return True
+    except Exception:
+        return False
+
+
+def is_valid_safetensors(path: Path) -> bool:
+    try:
+        validate_safetensors(path)
+        return True
+    except Exception:
+        return False
+
+
 def atomic_symlink(target: Path, link: Path) -> None:
     target = target.resolve(strict=True)
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -88,97 +99,124 @@ def atomic_symlink(target: Path, link: Path) -> None:
     print(f"[ready] {link}")
 
 
-def prepare_models() -> None:
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+def prepare_anima() -> None:
+    transformer = MODEL_DIR / "transformers" / "anima.safetensors"
+    vae = MODEL_DIR / "vae" / "qwen_image_vae.safetensors"
+    need_transformer = FORCE or not is_valid_safetensors(transformer)
+    need_vae = FORCE or not is_valid_safetensors(vae)
+
+    if not need_transformer:
+        print(f"[skip] {transformer}")
+    if not need_vae:
+        print(f"[skip] {vae}")
+    if not need_transformer and not need_vae:
+        return
 
     anima_store = MODEL_DIR / ".anima-source"
-    transformer_source = Path(
-        hf_hub_download(
-            repo_id=ANIMA_REPO,
-            filename=ANIMA_FILE,
-            revision=ANIMA_REVISION,
-            local_dir=anima_store,
-            force_download=FORCE,
-            token=HF_TOKEN,
+    if need_transformer:
+        source = Path(
+            hf_hub_download(
+                repo_id=ANIMA_REPO,
+                filename=ANIMA_FILE,
+                revision=ANIMA_REVISION,
+                local_dir=anima_store,
+                force_download=FORCE,
+                token=HF_TOKEN,
+            )
         )
-    )
-    vae_source = Path(
-        hf_hub_download(
-            repo_id=ANIMA_REPO,
-            filename="split_files/vae/qwen_image_vae.safetensors",
-            revision=ANIMA_REVISION,
-            local_dir=anima_store,
-            force_download=FORCE,
-            token=HF_TOKEN,
-        )
-    )
-    validate_safetensors(transformer_source)
-    validate_safetensors(vae_source)
+        validate_safetensors(source)
+        atomic_symlink(source, transformer)
 
-    atomic_symlink(transformer_source, MODEL_DIR / "transformers" / "anima.safetensors")
-    atomic_symlink(vae_source, MODEL_DIR / "vae" / "qwen_image_vae.safetensors")
-
-    qwen_dir = Path(
-        snapshot_download(
-            repo_id=QWEN_REPO,
-            revision=QWEN_REVISION,
-            local_dir=MODEL_DIR / "text_encoders",
-            allow_patterns=[
-                "config.json",
-                "generation_config.json",
-                "model.safetensors",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "vocab.json",
-                "merges.txt",
-            ],
-            force_download=FORCE,
-            token=HF_TOKEN,
+    if need_vae:
+        source = Path(
+            hf_hub_download(
+                repo_id=ANIMA_REPO,
+                filename="split_files/vae/qwen_image_vae.safetensors",
+                revision=ANIMA_REVISION,
+                local_dir=anima_store,
+                force_download=FORCE,
+                token=HF_TOKEN,
+            )
         )
-    )
-    t5_dir = Path(
-        snapshot_download(
-            repo_id=T5_REPO,
-            revision=T5_REVISION,
-            local_dir=MODEL_DIR / "t5_tokenizer",
-            allow_patterns=[
-                "spiece.model",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-            ],
-            force_download=FORCE,
-            token=HF_TOKEN,
-        )
-    )
+        validate_safetensors(source)
+        atomic_symlink(source, vae)
 
+
+def prepare_qwen() -> None:
+    target = MODEL_DIR / "text_encoders"
     required = [
-        qwen_dir / "config.json",
-        qwen_dir / "model.safetensors",
-        qwen_dir / "tokenizer_config.json",
-        t5_dir / "spiece.model",
-        t5_dir / "tokenizer_config.json",
-        t5_dir / "special_tokens_map.json",
+        target / "config.json",
+        target / "model.safetensors",
+        target / "tokenizer_config.json",
     ]
+    tokenizer_ok = is_valid_file(target / "tokenizer.json") or (
+        is_valid_file(target / "vocab.json") and is_valid_file(target / "merges.txt")
+    )
+    if not FORCE and all(is_valid_file(path) for path in required) and tokenizer_ok:
+        if is_valid_safetensors(target / "model.safetensors"):
+            print(f"[skip] {target}")
+            return
+
+    snapshot_download(
+        repo_id=QWEN_REPO,
+        revision=QWEN_REVISION,
+        local_dir=target,
+        allow_patterns=[
+            "config.json",
+            "generation_config.json",
+            "model.safetensors",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+        ],
+        force_download=FORCE,
+        token=HF_TOKEN,
+    )
     for path in required:
         validate_nonempty(path)
-    validate_safetensors(qwen_dir / "model.safetensors")
-
-    marker = MODEL_DIR / ".model-sources.json"
-    marker_tmp = marker.with_suffix(".json.tmp")
-    marker_tmp.write_text(
-        json.dumps(
-            {
-                "anima": {"repo": ANIMA_REPO, "revision": ANIMA_REVISION, "file": ANIMA_FILE},
-                "qwen": {"repo": QWEN_REPO, "revision": QWEN_REVISION},
-                "t5": {"repo": T5_REPO, "revision": T5_REVISION},
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    validate_safetensors(target / "model.safetensors")
+    tokenizer_ok = is_valid_file(target / "tokenizer.json") or (
+        is_valid_file(target / "vocab.json") and is_valid_file(target / "merges.txt")
     )
-    os.replace(marker_tmp, marker)
+    if not tokenizer_ok:
+        raise RuntimeError(f"Qwen tokenizer files are incomplete under {target}")
+    print(f"[ready] {target}")
+
+
+def prepare_t5() -> None:
+    target = MODEL_DIR / "t5_tokenizer"
+    required = [
+        target / "spiece.model",
+        target / "tokenizer_config.json",
+        target / "special_tokens_map.json",
+    ]
+    if not FORCE and all(is_valid_file(path) for path in required):
+        print(f"[skip] {target}")
+        return
+
+    snapshot_download(
+        repo_id=T5_REPO,
+        revision=T5_REVISION,
+        local_dir=target,
+        allow_patterns=[
+            "spiece.model",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ],
+        force_download=FORCE,
+        token=HF_TOKEN,
+    )
+    for path in required:
+        validate_nonempty(path)
+    print(f"[ready] {target}")
+
+
+def prepare_models() -> None:
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    prepare_anima()
+    prepare_qwen()
+    prepare_t5()
     print(f"Model preparation complete: {MODEL_DIR}")
 
 
