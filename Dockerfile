@@ -105,7 +105,7 @@ fetch_file() {
     local remote_file="$3"
     local destination="$4"
 
-    if [[ -s "$destination" && "${FORCE_DOWNLOAD:-0}" != "1" ]]; then
+    if [[ -s "$destination" ]]; then
         echo "[skip] $destination"
         return
     fi
@@ -114,9 +114,22 @@ fetch_file() {
     echo "[download] ${repo}@${revision}:${remote_file}"
     local cached
     cached="$(hf download "$repo" "$remote_file" --revision "$revision" --quiet)"
-    local temporary="${destination}.part"
+
+    if [[ -e "$destination" && "$cached" -ef "$destination" ]]; then
+        echo "[ready] $destination"
+        return
+    fi
+
+    local temporary="${destination}.part.$$"
     rm -f "$temporary"
     ln "$cached" "$temporary" 2>/dev/null || cp "$cached" "$temporary"
+
+    if [[ -e "$destination" && "$temporary" -ef "$destination" ]]; then
+        rm -f "$temporary"
+        echo "[ready] $destination"
+        return
+    fi
+
     mv -f "$temporary" "$destination"
 }
 
