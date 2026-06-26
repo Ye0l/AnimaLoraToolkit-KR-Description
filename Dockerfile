@@ -31,6 +31,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_XET_CACHE=/workspace/.cache/huggingface/xet \
     HF_XET_HIGH_PERFORMANCE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
     XDG_CACHE_HOME=/workspace/.cache \
     TORCH_HOME=/workspace/.cache/torch \
     TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torch/inductor \
@@ -61,6 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && printf '%s\n' \
         'PermitRootLogin prohibit-password' \
         'PasswordAuthentication no' \
+        'KbdInteractiveAuthentication no' \
         'PubkeyAuthentication yes' \
         > /etc/ssh/sshd_config.d/99-runpod.conf
 
@@ -72,7 +74,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
         --index-url https://download.pytorch.org/whl/cu128 \
-    && grep -vE '^pillow-jxlpy([<>=!~].*)?$' /tmp/requirements.txt > /tmp/requirements.runpod.txt \
+    && grep -vE '^(torch|torchvision|pillow-jxlpy)([<>=!~].*)?$' /tmp/requirements.txt > /tmp/requirements.runpod.txt \
     && python -m pip install --no-cache-dir -r /tmp/requirements.runpod.txt \
     && python -m pip install --no-cache-dir \
         'huggingface_hub>=0.34.0' \
@@ -90,48 +92,160 @@ set -eu
 
 cat > /usr/local/bin/download-anima-models <<'SCRIPT'
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+umask 022
 
 MODEL_DIR="${MODEL_DIR:-/workspace/models}"
+WORKSPACE="${WORKSPACE:-/workspace}"
 ANIMA_REPO="${ANIMA_REPO:-circlestone-labs/Anima}"
 ANIMA_REVISION="${ANIMA_REVISION:-main}"
 ANIMA_FILE="${ANIMA_FILE:-split_files/diffusion_models/anima-preview.safetensors}"
 
-mkdir -p "$MODEL_DIR/transformers" "$MODEL_DIR/vae" "$MODEL_DIR/text_encoders" "$MODEL_DIR/t5_tokenizer"
+mkdir -p \
+    "$MODEL_DIR/transformers" \
+    "$MODEL_DIR/vae" \
+    "$MODEL_DIR/text_encoders" \
+    "$MODEL_DIR/t5_tokenizer" \
+    "$WORKSPACE/.locks"
+
+# Prevent boot-time auto-download and train-runpod from modifying the same files.
+exec 9>"$WORKSPACE/.locks/anima-model-download.lock"
+flock 9
+
+validate_file() {
+    local path="$1"
+    [[ -f "$path" && -s "$path" ]] || return 1
+
+    case "$path" in
+        *.json)
+            python - "$path" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    json.load(handle)
+PY
+            ;;
+        *.safetensors)
+            python - "$path" <<'PY'
+import sys
+from safetensors import safe_open
+with safe_open(sys.argv[1], framework="pt", device="cpu") as handle:
+    if not list(handle.keys()):
+        raise SystemExit("safetensors file has no tensors")
+PY
+            ;;
+    esac
+}
+
+materialize_cached_file() {
+    local cached="$1"
+    local destination="$2"
+
+    validate_file "$cached" || {
+        echo "ERROR: Downloaded cache file is invalid: $cached" >&2
+        return 1
+    }
+
+    if [[ -e "$destination" && "$cached" -ef "$destination" ]]; then
+        validate_file "$destination"
+        echo "[ready] $destination"
+        return
+    fi
+
+    mkdir -p "$(dirname "$destination")"
+    local temporary="${destination}.part.$$.${RANDOM}"
+    rm -f -- "$temporary"
+
+    if ! cp --reflink=auto --preserve=mode,timestamps -- "$cached" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+
+    if ! validate_file "$temporary"; then
+        echo "ERROR: Temporary model file failed validation: $temporary" >&2
+        rm -f -- "$temporary"
+        return 1
+    fi
+
+    mv -fT -- "$temporary" "$destination"
+}
 
 fetch_file() {
     local repo="$1"
     local revision="$2"
     local remote_file="$3"
     local destination="$4"
+    local source_spec="${repo}@${revision}:${remote_file}"
+    local source_marker="${destination}.source"
+    local force="${FORCE_DOWNLOAD:-0}"
+    local recorded_source=""
 
-    if [[ -s "$destination" ]]; then
+    if [[ -f "$source_marker" ]]; then
+        IFS= read -r recorded_source < "$source_marker" || true
+    fi
+
+    # No marker means a user-managed file. Preserve it unless force download is requested.
+    if validate_file "$destination" && [[ "$force" != "1" ]] \
+        && { [[ -z "$recorded_source" ]] || [[ "$recorded_source" == "$source_spec" ]]; }; then
         echo "[skip] $destination"
         return
     fi
 
-    mkdir -p "$(dirname "$destination")"
-    echo "[download] ${repo}@${revision}:${remote_file}"
+    echo "[download] $source_spec"
     local cached
-    cached="$(hf download "$repo" "$remote_file" --revision "$revision" --quiet)"
+    cached="$(python - "$repo" "$remote_file" "$revision" "$force" <<'PY'
+import os
+import sys
+from huggingface_hub import hf_hub_download
 
-    if [[ -e "$destination" && "$cached" -ef "$destination" ]]; then
-        echo "[ready] $destination"
-        return
-    fi
+repo_id, filename, revision, force = sys.argv[1:5]
+path = hf_hub_download(
+    repo_id=repo_id,
+    filename=filename,
+    revision=revision,
+    force_download=(force == "1"),
+    token=os.environ.get("HF_TOKEN") or None,
+)
+print(path)
+PY
+)"
 
-    local temporary="${destination}.part.$$"
-    rm -f "$temporary"
-    ln "$cached" "$temporary" 2>/dev/null || cp "$cached" "$temporary"
+    materialize_cached_file "$cached" "$destination"
 
-    if [[ -e "$destination" && "$temporary" -ef "$destination" ]]; then
-        rm -f "$temporary"
-        echo "[ready] $destination"
-        return
-    fi
-
-    mv -f "$temporary" "$destination"
+    local marker_tmp="${source_marker}.part.$$"
+    printf '%s\n' "$source_spec" > "$marker_tmp"
+    mv -fT -- "$marker_tmp" "$source_marker"
+    echo "[ready] $destination"
 }
+
+run_self_test() {
+    local test_dir
+    test_dir="$(mktemp -d)"
+    local source="$test_dir/source.bin"
+    local destination="$test_dir/destination.bin"
+    local same_file="$test_dir/same.bin"
+    local empty_file="$test_dir/empty.bin"
+
+    printf 'model-download-self-test\n' > "$source"
+    materialize_cached_file "$source" "$destination"
+    cmp -s "$source" "$destination"
+
+    ln "$source" "$same_file"
+    materialize_cached_file "$source" "$same_file"
+    cmp -s "$source" "$same_file"
+
+    : > "$empty_file"
+    materialize_cached_file "$source" "$empty_file"
+    cmp -s "$source" "$empty_file"
+
+    rm -rf -- "$test_dir"
+    echo "download-anima-models self-test: OK"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+    run_self_test
+    exit 0
+fi
 
 fetch_file "$ANIMA_REPO" "$ANIMA_REVISION" "$ANIMA_FILE" \
     "$MODEL_DIR/transformers/anima.safetensors"
@@ -152,9 +266,95 @@ done
 echo "Model preparation complete: $MODEL_DIR"
 SCRIPT
 
+cat > /usr/local/bin/validate-anima-training <<'SCRIPT'
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import yaml
+from safetensors import safe_open
+
+config_path = Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/AnimaLoraToolkit/config/runpod-docker.yaml")
+if not config_path.is_file():
+    raise SystemExit(f"Config file not found: {config_path}")
+
+with config_path.open("r", encoding="utf-8") as handle:
+    config = yaml.safe_load(handle) or {}
+
+required = ("transformer_path", "vae_path", "text_encoder_path", "t5_tokenizer_path", "data_dir", "output_dir")
+missing_keys = [key for key in required if not config.get(key)]
+if missing_keys:
+    raise SystemExit(f"Missing config keys: {', '.join(missing_keys)}")
+
+for key in ("batch_size", "grad_accum", "epochs", "resolution"):
+    value = int(config.get(key, 0))
+    if value <= 0:
+        raise SystemExit(f"{key} must be greater than 0, got {value}")
+
+resolution = int(config["resolution"])
+if resolution % 64:
+    raise SystemExit(f"resolution must be divisible by 64, got {resolution}")
+
+for key in ("transformer_path", "vae_path"):
+    path = Path(config[key])
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit(f"Missing or empty model file: {path}")
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+        if not keys:
+            raise SystemExit(f"No tensors found in {path}")
+        if key == "transformer_path" and not any(name.endswith("x_embedder.proj.1.weight") for name in keys):
+            raise SystemExit(f"The selected transformer does not look like a complete Anima checkpoint: {path}")
+
+qwen = Path(config["text_encoder_path"])
+for name in ("config.json", "model.safetensors", "tokenizer_config.json"):
+    path = qwen / name
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit(f"Missing Qwen file: {path}")
+if not (qwen / "tokenizer.json").is_file() and not ((qwen / "vocab.json").is_file() and (qwen / "merges.txt").is_file()):
+    raise SystemExit(f"Missing Qwen tokenizer files under {qwen}")
+
+for name in ("spiece.model", "tokenizer_config.json", "special_tokens_map.json"):
+    path = Path(config["t5_tokenizer_path"]) / name
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit(f"Missing T5 tokenizer file: {path}")
+
+data_dir = Path(config["data_dir"])
+if not data_dir.is_dir():
+    raise SystemExit(f"Dataset directory not found: {data_dir}")
+
+extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+images = [path for path in data_dir.rglob("*") if path.suffix.lower() in extensions]
+paired = [
+    path for path in images
+    if path.with_suffix(".txt").is_file()
+    or path.with_suffix(".caption").is_file()
+    or (bool(config.get("prefer_json", True)) and path.with_suffix(".json").is_file())
+]
+if not paired:
+    raise SystemExit(f"No image/caption pairs found under {data_dir}")
+if len(paired) != len(images):
+    print(f"WARNING: {len(images) - len(paired)} image(s) have no matching caption and will be skipped.", file=sys.stderr)
+
+effective_samples = len(paired) * max(1, int(config.get("repeats", 1)))
+effective_batch = int(config["batch_size"]) * int(config["grad_accum"])
+if effective_samples < effective_batch:
+    raise SystemExit(
+        f"Dataset is too small for one optimizer step: samples={effective_samples}, effective_batch={effective_batch}"
+    )
+
+Path(config["output_dir"]).mkdir(parents=True, exist_ok=True)
+print(
+    f"Training preflight OK: pairs={len(paired)}, repeats={config.get('repeats', 1)}, "
+    f"batch={config['batch_size']}x{config['grad_accum']}"
+)
+SCRIPT
+
 cat > /usr/local/bin/train-runpod <<'SCRIPT'
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 cd "${APP_DIR:-/opt/AnimaLoraToolkit}"
 mkdir -p "${OUTPUT_DIR:-/workspace/output}" "${WORKSPACE:-/workspace}/logs"
@@ -164,6 +364,8 @@ if [[ "${DOWNLOAD_MODELS_ON_TRAIN:-1}" == "1" ]]; then
 fi
 
 config="${TRAIN_CONFIG:-/opt/AnimaLoraToolkit/config/runpod-docker.yaml}"
+validate-anima-training "$config"
+
 log_file="${TRAIN_LOG:-/workspace/logs/anima-training-$(date +%Y%m%d-%H%M%S).log}"
 command=(python -u anima_train.py --config "$config" --no-monitor "$@")
 printf -v quoted '%q ' "${command[@]}"
@@ -173,9 +375,34 @@ printf -v quoted '%q ' "${command[@]}"
 exec script -q -f -e -c "$quoted" "$log_file"
 SCRIPT
 
+cat > /usr/local/bin/runpod-self-test <<'SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+bash -n /usr/local/bin/download-anima-models
+bash -n /usr/local/bin/train-runpod
+bash -n /usr/local/bin/runpod-entrypoint
+python -m py_compile /opt/AnimaLoraToolkit/anima_train.py
+python -m uploadserver --help >/dev/null
+/usr/sbin/sshd -t
+download-anima-models --self-test
+python - <<'PY'
+import yaml
+from pathlib import Path
+path = Path("/opt/AnimaLoraToolkit/config/runpod-docker.yaml")
+config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+required = {"transformer_path", "vae_path", "text_encoder_path", "t5_tokenizer_path", "data_dir", "output_dir"}
+missing = sorted(required - config.keys())
+if missing:
+    raise SystemExit(f"Missing RunPod config keys: {missing}
+")
+PY
+echo "RunPod image self-test: OK"
+SCRIPT
+
 cat > /usr/local/bin/runpod-entrypoint <<'SCRIPT'
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 workspace="${WORKSPACE:-/workspace}"
 upload_dir="${UPLOAD_DIR:-/workspace/dataset}"
@@ -194,13 +421,15 @@ mkdir -p \
 
 if [[ "${SSH_ENABLED:-1}" == "1" ]]; then
     chmod 700 /root/.ssh
-    if [[ -n "${PUBLIC_KEY:-}" ]]; then
-        printf '%s\n' "$PUBLIC_KEY" > /root/.ssh/authorized_keys
+    ssh_key="${SSH_PUBLIC_KEY:-${PUBLIC_KEY:-}}"
+    if [[ -n "$ssh_key" ]]; then
+        printf '%s\n' "$ssh_key" > /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
     else
-        echo "WARNING: PUBLIC_KEY is empty; SSH key login may not work. Add an SSH key to the RunPod account/template."
+        echo "WARNING: SSH_PUBLIC_KEY/PUBLIC_KEY is empty; SSH key login may not work."
     fi
     ssh-keygen -A
+    /usr/sbin/sshd -t
     /usr/sbin/sshd
     echo "SSH server started on container port 22."
 fi
@@ -222,8 +451,28 @@ if [[ "${WEBUI_ENABLED:-1}" == "1" ]]; then
 
     webui+=("$webui_port")
     "${webui[@]}" > "$workspace/logs/uploadserver.log" 2>&1 &
-    echo "Upload Web UI started on port $webui_port; upload page: /upload"
-    echo "Upload destination: $upload_dir"
+    webui_pid=$!
+
+    webui_ready=0
+    for _ in $(seq 1 30); do
+        if ! kill -0 "$webui_pid" 2>/dev/null; then
+            break
+        fi
+        status="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${webui_port}/upload" || true)"
+        if [[ "$status" == "200" || "$status" == "401" ]]; then
+            webui_ready=1
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [[ "$webui_ready" == "1" ]]; then
+        echo "Upload Web UI started on port $webui_port; upload page: /upload"
+        echo "Upload destination: $upload_dir"
+    else
+        echo "WARNING: Upload Web UI failed to start. Log follows:" >&2
+        tail -n 50 "$workspace/logs/uploadserver.log" >&2 || true
+    fi
 fi
 
 if [[ "${AUTO_DOWNLOAD_MODELS:-1}" == "1" ]]; then
@@ -298,7 +547,14 @@ no_monitor: true
 no_browser: true
 YAML
 
-chmod +x /usr/local/bin/download-anima-models /usr/local/bin/train-runpod /usr/local/bin/runpod-entrypoint
+chmod +x \
+    /usr/local/bin/download-anima-models \
+    /usr/local/bin/validate-anima-training \
+    /usr/local/bin/train-runpod \
+    /usr/local/bin/runpod-self-test \
+    /usr/local/bin/runpod-entrypoint
+
+/usr/local/bin/runpod-self-test
 SETUP
 
 EXPOSE 22 7860
