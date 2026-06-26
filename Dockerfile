@@ -22,6 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DATA_DIR=/workspace/dataset \
     OUTPUT_DIR=/workspace/output \
     UPLOAD_DIR=/workspace/dataset \
+    SSH_ENABLED=1 \
     WEBUI_ENABLED=1 \
     WEBUI_PORT=7860 \
     WEBUI_USER=runpod \
@@ -46,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         nano \
+        openssh-server \
         procps \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-venv \
@@ -53,7 +55,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
         util-linux \
     && rm -rf /var/lib/apt/lists/* \
-    && python${PYTHON_VERSION} -m venv ${VIRTUAL_ENV}
+    && python${PYTHON_VERSION} -m venv ${VIRTUAL_ENV} \
+    && mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
+    && chmod 700 /root/.ssh \
+    && printf '%s\n' \
+        'PermitRootLogin prohibit-password' \
+        'PasswordAuthentication no' \
+        'PubkeyAuthentication yes' \
+        > /etc/ssh/sshd_config.d/99-runpod.conf
 
 WORKDIR ${APP_DIR}
 COPY requirements.txt /tmp/requirements.txt
@@ -166,7 +175,22 @@ mkdir -p \
     "$upload_dir" \
     "$workspace/logs" \
     "${HF_HOME:-/workspace/.cache/huggingface}" \
-    "${TORCH_HOME:-/workspace/.cache/torch}"
+    "${TORCH_HOME:-/workspace/.cache/torch}" \
+    /run/sshd \
+    /root/.ssh
+
+if [[ "${SSH_ENABLED:-1}" == "1" ]]; then
+    chmod 700 /root/.ssh
+    if [[ -n "${PUBLIC_KEY:-}" ]]; then
+        printf '%s\n' "$PUBLIC_KEY" > /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+    else
+        echo "WARNING: PUBLIC_KEY is empty; SSH key login may not work. Add an SSH key to the RunPod account/template."
+    fi
+    ssh-keygen -A
+    /usr/sbin/sshd
+    echo "SSH server started on container port 22."
+fi
 
 if [[ "${WEBUI_ENABLED:-1}" == "1" ]]; then
     webui=(
@@ -191,7 +215,7 @@ fi
 
 if [[ "${AUTO_DOWNLOAD_MODELS:-1}" == "1" ]]; then
     if ! download-anima-models; then
-        echo "WARNING: Automatic model download failed. The container and Upload Web UI will remain running." >&2
+        echo "WARNING: Automatic model download failed. The container, SSH, and Upload Web UI will remain running." >&2
     fi
 fi
 
@@ -264,7 +288,7 @@ YAML
 chmod +x /usr/local/bin/download-anima-models /usr/local/bin/train-runpod /usr/local/bin/runpod-entrypoint
 SETUP
 
-EXPOSE 7860
+EXPOSE 22 7860
 VOLUME ["/workspace"]
 WORKDIR ${APP_DIR}
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/runpod-entrypoint"]
