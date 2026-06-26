@@ -99,7 +99,7 @@ fetch_file() {
     mkdir -p "$(dirname "$destination")"
     echo "[download] ${repo}@${revision}:${remote_file}"
     local cached
-    cached="$(hf download "$repo" "$remote_file" --revision "$revision")"
+    cached="$(hf download "$repo" "$remote_file" --revision "$revision" --quiet)"
     local temporary="${destination}.part"
     rm -f "$temporary"
     ln "$cached" "$temporary" 2>/dev/null || cp "$cached" "$temporary"
