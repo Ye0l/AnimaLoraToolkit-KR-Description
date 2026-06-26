@@ -21,6 +21,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MODEL_DIR=/workspace/models \
     DATA_DIR=/workspace/dataset \
     OUTPUT_DIR=/workspace/output \
+    UPLOAD_DIR=/workspace/dataset \
+    WEBUI_ENABLED=1 \
+    WEBUI_PORT=7860 \
+    WEBUI_USER=runpod \
     HF_HOME=/workspace/.cache/huggingface \
     HF_HUB_CACHE=/workspace/.cache/huggingface/hub \
     HF_XET_CACHE=/workspace/.cache/huggingface/xet \
@@ -67,6 +71,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
         protobuf \
         sentencepiece \
         tiktoken \
+        uploadserver==6.0.1 \
     && rm -f /tmp/requirements.txt /tmp/requirements.runpod.txt
 
 COPY . ${APP_DIR}
@@ -150,16 +155,44 @@ cat > /usr/local/bin/runpod-entrypoint <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
+workspace="${WORKSPACE:-/workspace}"
+upload_dir="${UPLOAD_DIR:-/workspace/dataset}"
+webui_port="${WEBUI_PORT:-7860}"
+
 mkdir -p \
     "${MODEL_DIR:-/workspace/models}" \
     "${DATA_DIR:-/workspace/dataset}" \
     "${OUTPUT_DIR:-/workspace/output}" \
-    "${WORKSPACE:-/workspace}/logs" \
+    "$upload_dir" \
+    "$workspace/logs" \
     "${HF_HOME:-/workspace/.cache/huggingface}" \
     "${TORCH_HOME:-/workspace/.cache/torch}"
 
+if [[ "${WEBUI_ENABLED:-1}" == "1" ]]; then
+    webui=(
+        python -m uploadserver
+        --bind 0.0.0.0
+        --directory "$upload_dir"
+        --theme dark
+        --allow-replace
+    )
+
+    if [[ -n "${WEBUI_PASSWORD:-}" ]]; then
+        webui+=(--basic-auth "${WEBUI_USER:-runpod}:${WEBUI_PASSWORD}")
+    else
+        echo "WARNING: Upload Web UI has no password. Set WEBUI_PASSWORD in the RunPod template."
+    fi
+
+    webui+=("$webui_port")
+    "${webui[@]}" > "$workspace/logs/uploadserver.log" 2>&1 &
+    echo "Upload Web UI started on port $webui_port; upload page: /upload"
+    echo "Upload destination: $upload_dir"
+fi
+
 if [[ "${AUTO_DOWNLOAD_MODELS:-1}" == "1" ]]; then
-    download-anima-models
+    if ! download-anima-models; then
+        echo "WARNING: Automatic model download failed. The container and Upload Web UI will remain running." >&2
+    fi
 fi
 
 if [[ "$#" -eq 0 ]]; then
@@ -231,6 +264,7 @@ YAML
 chmod +x /usr/local/bin/download-anima-models /usr/local/bin/train-runpod /usr/local/bin/runpod-entrypoint
 SETUP
 
+EXPOSE 7860
 VOLUME ["/workspace"]
 WORKDIR ${APP_DIR}
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/runpod-entrypoint"]
