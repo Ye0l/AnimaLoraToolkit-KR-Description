@@ -1,1 +1,2 @@
-resolution: 1024
+# Deprecated placeholder. The Docker image uses config/runpod-docker.yaml,
+# which is generated and validated during the image build.
