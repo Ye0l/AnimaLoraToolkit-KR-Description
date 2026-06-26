@@ -115,7 +115,7 @@ jobs:
           wait_for_services
           docker exec runpod-smoke python -m pip check
           docker exec runpod-smoke bash -n /opt/AnimaLoraToolkit/docker/entrypoint.sh
-          docker exec runpod-smoke python /opt/AnimaLoraToolkit/docker/download_models.py --self-test
+          docker exec runpod-smoke python /opt/AnimaLoraToolkit/docker/download_models_direct.py --self-test
 
           docker restart runpod-smoke >/dev/null
           wait_for_services
