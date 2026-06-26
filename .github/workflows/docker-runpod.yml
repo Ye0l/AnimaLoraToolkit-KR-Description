@@ -18,7 +18,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ye0l/animaloratoolkit-kr-description
 
 jobs:
   build:
@@ -58,32 +58,53 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Test startup and restart
+      - name: Test startup, SSH, Web UI, and restart
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          key_file="$RUNNER_TEMP/runpod-smoke-key"
+          ssh-keygen -q -t ed25519 -N '' -f "$key_file"
+
           cleanup() {
             docker logs runpod-smoke 2>/dev/null || true
             docker rm -f runpod-smoke 2>/dev/null || true
+            rm -f "$key_file" "$key_file.pub"
           }
           trap cleanup EXIT
 
           docker run -d \
             --name runpod-smoke \
             -e AUTO_DOWNLOAD_MODELS=0 \
-            -e SSH_ENABLED=0 \
+            -e SSH_ENABLED=1 \
+            -e SSH_PUBLIC_KEY="$(cat "$key_file.pub")" \
             -e WEBUI_ENABLED=1 \
             -e WEBUI_USER=runpod \
             -e WEBUI_PASSWORD=smoke-test \
+            -p 12222:22 \
             -p 17860:7860 \
             animalora-runpod:smoke
 
-          wait_for_upload_ui() {
-            for _ in $(seq 1 60); do
+          wait_for_services() {
+            local web_ok=0
+            local ssh_ok=0
+            for _ in $(seq 1 80); do
               if curl --fail --silent --show-error \
                 --user runpod:smoke-test \
                 http://127.0.0.1:17860/upload >/dev/null; then
+                web_ok=1
+              fi
+              if ssh -q \
+                -i "$key_file" \
+                -p 12222 \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=2 \
+                root@127.0.0.1 true; then
+                ssh_ok=1
+              fi
+              if [[ "$web_ok" == 1 && "$ssh_ok" == 1 ]]; then
                 return 0
               fi
               sleep 0.5
@@ -91,13 +112,13 @@ jobs:
             return 1
           }
 
-          wait_for_upload_ui
+          wait_for_services
           docker exec runpod-smoke python -m pip check
           docker exec runpod-smoke bash -n /opt/AnimaLoraToolkit/docker/entrypoint.sh
           docker exec runpod-smoke python /opt/AnimaLoraToolkit/docker/download_models.py --self-test
 
           docker restart runpod-smoke >/dev/null
-          wait_for_upload_ui
+          wait_for_services
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
