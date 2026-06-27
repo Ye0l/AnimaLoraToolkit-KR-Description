@@ -81,7 +81,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
         /tmp/requirements.txt > /tmp/requirements.runpod.txt \
     && python -m pip install --no-cache-dir -r /tmp/requirements.runpod.txt \
     && python -m pip install --no-cache-dir --upgrade \
-        'huggingface_hub>=0.36.0' \
+        'huggingface_hub>=0.36.0,<1.0' \
         hf-xet \
         protobuf \
         sentencepiece \
