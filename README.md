@@ -379,9 +379,33 @@ TRAIN_CONFIG=/workspace/my_character.yaml train-runpod
 모델 확인 및 누락 파일 다운로드
 → 학습 전 검사
 → anima_train.py 실행
+→ 설정 확인/수정 TUI 표시 (주요 설정값 검토)
 → Rich 진행 화면 표시
 → 동일 출력을 로그에 저장
 ```
+
+## 설정 확인/수정 TUI
+
+학습이 실제로 시작되기 전에 주요 설정값을 표로 보여주고 그 자리에서 수정할 수 있습니다.
+
+- **번호 입력** → 해당 설정 수정 (원하는 순서로 왔다갔다 수정 가능)
+- **Enter 또는 `s`** → 현재 값으로 학습 시작
+- **`e`** → 현재 적용값을 YAML로 export
+- **`q`** → 취소
+
+기본값은 `my_character.yaml`(및 CLI 인자)에서 읽은 값이며, 화면에 각 설정의 짧은 설명이 함께 표시됩니다. 학습이 시작되면 최종 적용값이 항상 `/workspace/output/applied_config_<시각>.yaml`로 자동 저장되어 재현이 가능합니다.
+
+확인 없이 바로 시작하려면 `-y`(또는 `--yes`)를 붙입니다.
+
+```bash
+TRAIN_CONFIG=/workspace/my_character.yaml train-runpod -y
+```
+
+주요 설정 외에 이번에 노출된 항목:
+
+- `timestep_shift` (기본 3.0): 학습 노이즈 분포 편향. 낮출수록(예: 1.0) 세부 디테일 비중↑.
+- `train_llm_adapter` (기본 true): llm_adapter에도 LoRA를 넣을지. `false`로 두면 "트리거를 넣으면 구도가 통째로 딸려오는" 현상 완화에 도움될 수 있습니다.
+- `tag_dropout`: 이제 TXT 캡션에서도 실제로 동작합니다(이전에는 JSON 전용).
 
 로그 위치:
 

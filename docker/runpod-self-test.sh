@@ -7,6 +7,7 @@ bash -n "$app_dir/docker/entrypoint.sh"
 bash -n "$app_dir/docker/train-runpod.sh"
 python -m py_compile \
     "$app_dir/anima_train.py" \
+    "$app_dir/train_config_tui.py" \
     "$app_dir/docker/download_models_direct.py" \
     "$app_dir/docker/preflight.py"
 python -m pip check

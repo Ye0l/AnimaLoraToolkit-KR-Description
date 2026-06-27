@@ -131,7 +131,9 @@ def apply_yaml_config(args, config):
         "lora_alpha": "lora_alpha",
         "lokr_factor": "lokr_factor",
         "resume_lora": "resume_lora",
+        "train_llm_adapter": "train_llm_adapter",
         # 训练参数
+        "timestep_shift": "timestep_shift",
         "epochs": "epochs",
         "max_steps": "max_steps",
         "batch_size": "batch_size",
@@ -192,6 +194,8 @@ def apply_yaml_config(args, config):
         "lora_alpha": 32.0,
         "lokr_factor": 8,
         "resume_lora": "",
+        "train_llm_adapter": True,
+        "timestep_shift": 3.0,
         "epochs": 10,
         "max_steps": 0,
         "batch_size": 1,
@@ -1078,21 +1082,28 @@ class LoRAInjector:
     """LoRA 注入器"""
     DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
 
-    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None):
+    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None,
+                 train_llm_adapter=True):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.factor = factor
         self.targets = targets or self.DEFAULT_TARGETS
+        self.train_llm_adapter = train_llm_adapter
         self.injected = {}
 
     def inject(self, model):
         """注入 LoRA 到模型"""
+        skipped_llm_adapter = 0
         for name, module in list(model.named_modules()):
             if not isinstance(module, torch.nn.Linear):
                 continue
             if not any(t in name for t in self.targets):
+                continue
+            # llm_adapter 把提示词转成图像条件；同时训练它容易让触发词和构图纠缠在一起
+            if not self.train_llm_adapter and name.startswith("llm_adapter."):
+                skipped_llm_adapter += 1
                 continue
 
             lora_linear = LoRALinear(
@@ -1109,6 +1120,8 @@ class LoRAInjector:
             self.injected[name] = lora_linear
 
         logger.info(f"Injected {'LoKr' if self.use_lokr else 'LoRA'} into {len(self.injected)} layers")
+        if skipped_llm_adapter:
+            logger.info(f"Skipped llm_adapter layers (train_llm_adapter=False): {skipped_llm_adapter}")
         return self.injected
 
     def get_params(self):
@@ -1372,7 +1385,7 @@ class ImageDataset(Dataset):
         return samples
 
     def _process_caption_txt(self, caption):
-        """处理 TXT caption: 传统 tag 打乱 + keep_tokens"""
+        """处理 TXT caption: 传统 tag 打乱 + keep_tokens + tag_dropout"""
         if not caption:
             return ""
         if "," in caption:
@@ -1380,16 +1393,18 @@ class ImageDataset(Dataset):
         else:
             tags = caption.split()
 
-        if self.keep_tokens > 0:
-            kept = tags[:self.keep_tokens]
-            rest = tags[self.keep_tokens:]
-            if self.shuffle_caption:
-                random.shuffle(rest)
-            tags = kept + rest
-        elif self.shuffle_caption:
-            random.shuffle(tags)
+        kept = tags[:self.keep_tokens] if self.keep_tokens > 0 else []
+        rest = tags[self.keep_tokens:] if self.keep_tokens > 0 else tags
 
-        return ", ".join(tags)
+        # tag_dropout: 随机丢弃部分标签（保留 keep_tokens 不动），增强泛化、减弱构图固化
+        if self.tag_dropout > 0 and rest:
+            rest = [t for t in rest if random.random() >= self.tag_dropout]
+
+        if self.shuffle_caption:
+            random.shuffle(rest)
+
+        tags = kept + rest
+        return ", ".join(t for t in tags if t)
 
     def _process_caption_json(self, json_path):
         """处理 JSON caption: 分类 shuffle"""
@@ -1700,11 +1715,11 @@ def sample_image(
 # 训练辅助
 # ============================================================================
 
-def sample_t(bs, device):
-    """采样时间步 (logit-normal)"""
+def sample_t(bs, device, shift=3.0):
+    """采样时间步 (logit-normal)。shift 越大越偏向高噪声（结构/构图）区间。"""
     t = torch.sigmoid(torch.randn(bs, device=device))
-    shift = 3.0
-    t = (t * shift) / (1 + (shift - 1) * t)
+    if shift != 1.0:
+        t = (t * shift) / (1 + (shift - 1) * t)
     return t
 
 
@@ -1807,6 +1822,12 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lokr-factor", type=int, default=8)
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
+    p.add_argument("--train-llm-adapter", action=argparse.BooleanOptionalAction, default=True,
+                   help="是否给 llm_adapter 也注入 LoRA（关掉可减弱触发词和构图的纠缠）")
+
+    # 高级训练参数
+    p.add_argument("--timestep-shift", type=float, default=3.0,
+                   help="训练时间步采样的 shift（越大越偏结构/构图，越小越偏细节，1.0=不偏置）")
 
     # 采样参数
     p.add_argument("--sample-every", type=int, default=0, help="每 N 个 epoch 采样一次 (0=禁用)")
@@ -1840,6 +1861,8 @@ def parse_args():
     # 依赖和交互
     p.add_argument("--auto-install", action="store_true", help="自动安装缺失依赖")
     p.add_argument("--interactive", action="store_true", help="交互模式，提示输入缺失参数")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="跳过启动时的配置确认 TUI，直接用当前配置开始训练")
 
     return p.parse_args()
 
@@ -1958,6 +1981,15 @@ def main():
     if args.interactive or any(not x for x in required):
         args = prompt_for_args(args)
 
+    # 启动前的配置确认/修改 TUI（--yes 或非交互终端时跳过；总是导出最终配置快照）
+    try:
+        from train_config_tui import maybe_run_tui
+        args = maybe_run_tui(args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.warning(f"Config TUI unavailable, continuing with current config: {e}")
+
     # 依赖检测
     ensure_dependencies(auto_install=args.auto_install)
 
@@ -2048,6 +2080,7 @@ def main():
         alpha=args.lora_alpha,
         use_lokr=(args.lora_type == "lokr"),
         factor=args.lokr_factor,
+        train_llm_adapter=getattr(args, "train_llm_adapter", True),
     )
     injector.inject(model)
     
@@ -2305,7 +2338,7 @@ def main():
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
 
             # Flow Matching
-            t = sample_t(bs, device)
+            t = sample_t(bs, device, shift=getattr(args, "timestep_shift", 3.0))
             t_exp = t.view(-1, 1, 1, 1, 1)
             noise = torch.randn_like(latents)
             noisy = (1 - t_exp) * latents + t_exp * noise

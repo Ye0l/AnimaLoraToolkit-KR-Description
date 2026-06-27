@@ -107,6 +107,8 @@ lora_type: "lora"
 lora_rank: 32
 lora_alpha: 32.0
 lokr_factor: 8
+train_llm_adapter: true
+timestep_shift: 3.0
 epochs: 10
 max_steps: 0
 batch_size: 2
