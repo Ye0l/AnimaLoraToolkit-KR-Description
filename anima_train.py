@@ -411,7 +411,7 @@ def find_diffusion_pipe_root():
             return candidate
         if candidate and (candidate / "models" / "anima_modeling.py").exists():
             return candidate / "models"
-    raise RuntimeError("找不到 anima_modeling.py，请设置 DIFFUSION_PIPE_ROOT 或放置模型代码")
+    raise RuntimeError("anima_modeling.py not found. Set DIFFUSION_PIPE_ROOT or place the model code accordingly.")
 
 
 def load_module_from_path(module_name, file_path):
@@ -546,7 +546,7 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
     remap_name = "+".join(prefixes) if prefixes else "none"
 
     logger.info(
-        f"{label} 权重加载: remap={remap_name}, 匹配 {matched_after}/{len(model_keys)} ({coverage:.1%}), "
+        f"{label} weights loaded: remap={remap_name}, matched {matched_after}/{len(model_keys)} ({coverage:.1%}), "
         f"missing={len(missing)}, unexpected={len(unexpected)}"
     )
 
@@ -556,9 +556,10 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
     if coverage < 0.60 or len(critical_missing) > 0:
         preview_missing = ", ".join(critical_missing[:8])
         raise RuntimeError(
-            f"{label} 权重看起来没有正确加载（remap={remap_name}, coverage={coverage:.1%}）。"
-            f"关键参数缺失: {preview_missing or 'N/A'}。\n"
-            f"这通常表示你选错了 .safetensors（不是完整 transformer/vae 权重），或 checkpoint key 前缀不匹配。"
+            f"{label} weights do not look correctly loaded (remap={remap_name}, coverage={coverage:.1%}). "
+            f"Missing critical parameters: {preview_missing or 'N/A'}.\n"
+            f"This usually means you picked the wrong .safetensors (not a complete transformer/vae checkpoint), "
+            f"or the checkpoint key prefix doesn't match."
         )
     return {
         "remap": remap_name,
@@ -609,7 +610,7 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     elif model_channels == 5120:
         num_blocks, num_heads = 36, 40
     else:
-        raise RuntimeError(f"未知的 model_channels={model_channels}")
+        raise RuntimeError(f"Unknown model_channels={model_channels}")
 
     config = dict(
         max_img_h=240, max_img_w=240, max_frames=128,
