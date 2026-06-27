@@ -26,6 +26,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WEBUI_ENABLED=1 \
     WEBUI_PORT=7860 \
     WEBUI_USER=runpod \
+    JUPYTER_ENABLED=1 \
+    JUPYTER_PORT=8888 \
     AUTO_DOWNLOAD_MODELS=1 \
     HF_HOME=/workspace/.cache/huggingface \
     HF_HUB_CACHE=/workspace/.cache/huggingface/hub \
@@ -85,6 +87,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
         sentencepiece \
         tiktoken \
         uploadserver==6.0.1 \
+        jupyterlab \
     && rm -f /tmp/requirements.txt /tmp/requirements.runpod.txt
 
 COPY . ${APP_DIR}
@@ -168,7 +171,7 @@ RUN chmod +x ${APP_DIR}/docker/*.sh ${APP_DIR}/docker/*.py \
     && ln -sf ${APP_DIR}/docker/train-runpod.sh /usr/local/bin/train-runpod \
     && ${APP_DIR}/docker/runpod-self-test.sh
 
-EXPOSE 22 7860
+EXPOSE 22 7860 8888
 VOLUME ["/workspace"]
 WORKDIR ${APP_DIR}
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/AnimaLoraToolkit/docker/entrypoint.sh"]

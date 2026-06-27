@@ -4,6 +4,7 @@ set -Eeuo pipefail
 workspace="${WORKSPACE:-/workspace}"
 upload_dir="${UPLOAD_DIR:-/workspace/dataset}"
 webui_port="${WEBUI_PORT:-7860}"
+jupyter_port="${JUPYTER_PORT:-8888}"
 
 mkdir -p \
     "$workspace/logs" \
@@ -74,8 +75,53 @@ start_webui() {
     return 0
 }
 
+start_jupyter() {
+    [[ "${JUPYTER_ENABLED:-1}" == "1" ]] || return 0
+
+    local token="${JUPYTER_TOKEN:-}"
+    if [[ -z "$token" ]]; then
+        token="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+        echo "Generated random Jupyter token (set JUPYTER_TOKEN to override): $token"
+    fi
+
+    local -a command=(
+        python -m jupyterlab
+        --ip=0.0.0.0
+        --port="$jupyter_port"
+        --no-browser
+        --allow-root
+        --notebook-dir="$workspace"
+        --ServerApp.token="$token"
+        --ServerApp.password=""
+        --ServerApp.allow_remote_access=True
+    )
+
+    "${command[@]}" > "$workspace/logs/jupyter.log" 2>&1 &
+    local jupyter_pid=$!
+    local status=""
+
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$jupyter_pid" 2>/dev/null; then
+            break
+        fi
+        status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            "http://127.0.0.1:${jupyter_port}/login" || true)"
+        if [[ "$status" == "200" ]]; then
+            echo "Jupyter Lab started: port=$jupyter_port token=$token"
+            echo "Access URL: http://<host>:${jupyter_port}/lab?token=${token}"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "WARNING: Jupyter Lab failed to become ready. Log follows:" >&2
+    tail -n 80 "$workspace/logs/jupyter.log" >&2 || true
+    return 0
+}
+
 start_ssh
 start_webui
+start_jupyter
 
 if [[ "${AUTO_DOWNLOAD_MODELS:-1}" == "1" ]]; then
     if ! /usr/local/bin/download-anima-models; then

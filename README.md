@@ -12,6 +12,7 @@
 - CUDA 12.8
 - SSH 서버
 - 데이터셋 업로드 Web UI
+- Jupyter Lab
 - 시작 시 모델 자동 다운로드
 - 학습 전 모델·데이터셋·CUDA 검사
 - Rich 진행 화면과 로그 동시 저장
@@ -68,16 +69,19 @@ RunPod Template에서 다음 포트를 노출합니다.
 ```text
 TCP  22
 HTTP 7860
+HTTP 8888
 ```
 
 - `22`: SSH
 - `7860`: 파일 업로드 Web UI
+- `8888`: Jupyter Lab
 
 ## 권장 환경 변수
 
 ```text
 WEBUI_USER=runpod
 WEBUI_PASSWORD=충분히_긴_비밀번호
+JUPYTER_TOKEN=충분히_긴_토큰
 ```
 
 RunPod 계정에 SSH 공개키를 등록하면 보통 `PUBLIC_KEY` 환경 변수가 자동으로 전달됩니다. 직접 넣을 때는 다음 변수도 지원합니다.
@@ -94,6 +98,20 @@ SSH_ENABLED=1
 WEBUI_ENABLED=1
 WEBUI_PORT=7860
 UPLOAD_DIR=/workspace/dataset
+JUPYTER_ENABLED=1
+JUPYTER_PORT=8888
+```
+
+`JUPYTER_TOKEN`을 지정하지 않으면 컨테이너가 시작할 때마다 무작위 토큰을 생성하고 시작 로그에 접속 URL과 함께 출력합니다. RunPod의 외부 포트 매핑을 통해 다음과 같이 접속합니다.
+
+```text
+https://<RunPod에서 매핑된 호스트:포트>/lab?token=<로그에 출력된 토큰>
+```
+
+Jupyter Lab을 끄려면:
+
+```text
+JUPYTER_ENABLED=0
 ```
 
 모델 자동 다운로드를 끄려면:
@@ -112,6 +130,7 @@ AUTO_DOWNLOAD_MODELS=0
 /workspace 디렉터리 생성
 → SSH 서버 시작
 → 업로드 Web UI 시작
+→ Jupyter Lab 시작
 → 모델 존재 여부와 무결성 검사
 → 없거나 손상된 모델 다운로드
 → sleep infinity로 컨테이너 유지
@@ -124,10 +143,12 @@ AUTO_DOWNLOAD_MODELS=0
 ```text
 SSH server started on container port 22.
 Upload Web UI started: port=7860 path=/upload directory=/workspace/dataset
+Jupyter Lab started: port=8888 token=<생성된 토큰>
+Access URL: http://<host>:8888/lab?token=<생성된 토큰>
 Model preparation complete: /workspace/models
 ```
 
-모델 다운로드가 실패해도 SSH와 Web UI는 계속 실행됩니다.
+모델 다운로드가 실패해도 SSH, Web UI, Jupyter Lab은 계속 실행됩니다.
 
 ---
 
