@@ -26,6 +26,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WEBUI_ENABLED=1 \
     WEBUI_PORT=7860 \
     WEBUI_USER=runpod \
+    JUPYTER_ENABLED=1 \
+    JUPYTER_PORT=8888 \
     AUTO_DOWNLOAD_MODELS=1 \
     HF_HOME=/workspace/.cache/huggingface \
     HF_HUB_CACHE=/workspace/.cache/huggingface/hub \
@@ -40,6 +42,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        btop \
         ca-certificates \
         curl \
         git \
@@ -54,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
         tmux \
         util-linux \
+        wget \
     && rm -rf /var/lib/apt/lists/* \
     && python${PYTHON_VERSION} -m venv ${VIRTUAL_ENV} \
     && mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
@@ -76,13 +80,14 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && grep -vE '^(torch|torchvision|pillow-jxlpy)([<>=!~].*)?$' \
         /tmp/requirements.txt > /tmp/requirements.runpod.txt \
     && python -m pip install --no-cache-dir -r /tmp/requirements.runpod.txt \
-    && python -m pip install --no-cache-dir \
-        'huggingface_hub>=0.34.0' \
+    && python -m pip install --no-cache-dir --upgrade \
+        'huggingface_hub>=0.36.0' \
         hf-xet \
         protobuf \
         sentencepiece \
         tiktoken \
         uploadserver==6.0.1 \
+        jupyterlab \
     && rm -f /tmp/requirements.txt /tmp/requirements.runpod.txt
 
 COPY . ${APP_DIR}
@@ -105,6 +110,8 @@ lora_type: "lora"
 lora_rank: 32
 lora_alpha: 32.0
 lokr_factor: 8
+train_llm_adapter: true
+timestep_shift: 3.0
 epochs: 10
 max_steps: 0
 batch_size: 2
@@ -141,13 +148,30 @@ no_monitor: true
 no_browser: true
 YAML
 
+RUN cat >> /root/.bashrc <<'BASHRC'
+
+# AnimaLoraToolkit: activate the training venv and alias btop's UTF-8 flag.
+source /opt/venv/bin/activate
+alias btop='btop --utf-force'
+
+# Auto-attach (or create) a tmux session for interactive SSH logins only,
+# so the CI smoke test's non-interactive "ssh ... true" check is unaffected.
+if [[ $- == *i* ]] && [[ -z "${TMUX:-}" ]] && [[ -t 0 ]]; then
+    exec tmux new-session -A -s main
+fi
+BASHRC
+
+RUN printf '%s\n' \
+        '[[ -f ~/.bashrc ]] && source ~/.bashrc' \
+        > /root/.bash_profile
+
 RUN chmod +x ${APP_DIR}/docker/*.sh ${APP_DIR}/docker/*.py \
     && ln -sf ${APP_DIR}/docker/download_models_direct.py /usr/local/bin/download-anima-models \
     && ln -sf ${APP_DIR}/docker/preflight.py /usr/local/bin/validate-anima-training \
     && ln -sf ${APP_DIR}/docker/train-runpod.sh /usr/local/bin/train-runpod \
     && ${APP_DIR}/docker/runpod-self-test.sh
 
-EXPOSE 22 7860
+EXPOSE 22 7860 8888
 VOLUME ["/workspace"]
 WORKDIR ${APP_DIR}
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/AnimaLoraToolkit/docker/entrypoint.sh"]

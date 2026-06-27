@@ -12,6 +12,7 @@
 - CUDA 12.8
 - SSH 서버
 - 데이터셋 업로드 Web UI
+- Jupyter Lab
 - 시작 시 모델 자동 다운로드
 - 학습 전 모델·데이터셋·CUDA 검사
 - Rich 진행 화면과 로그 동시 저장
@@ -68,16 +69,19 @@ RunPod Template에서 다음 포트를 노출합니다.
 ```text
 TCP  22
 HTTP 7860
+HTTP 8888
 ```
 
 - `22`: SSH
 - `7860`: 파일 업로드 Web UI
+- `8888`: Jupyter Lab
 
 ## 권장 환경 변수
 
 ```text
 WEBUI_USER=runpod
 WEBUI_PASSWORD=충분히_긴_비밀번호
+JUPYTER_TOKEN=충분히_긴_토큰
 ```
 
 RunPod 계정에 SSH 공개키를 등록하면 보통 `PUBLIC_KEY` 환경 변수가 자동으로 전달됩니다. 직접 넣을 때는 다음 변수도 지원합니다.
@@ -94,6 +98,20 @@ SSH_ENABLED=1
 WEBUI_ENABLED=1
 WEBUI_PORT=7860
 UPLOAD_DIR=/workspace/dataset
+JUPYTER_ENABLED=1
+JUPYTER_PORT=8888
+```
+
+`JUPYTER_TOKEN`을 지정하지 않으면 컨테이너가 시작할 때마다 무작위 토큰을 생성하고 시작 로그에 접속 URL과 함께 출력합니다. RunPod의 외부 포트 매핑을 통해 다음과 같이 접속합니다.
+
+```text
+https://<RunPod에서 매핑된 호스트:포트>/lab?token=<로그에 출력된 토큰>
+```
+
+Jupyter Lab을 끄려면:
+
+```text
+JUPYTER_ENABLED=0
 ```
 
 모델 자동 다운로드를 끄려면:
@@ -112,6 +130,7 @@ AUTO_DOWNLOAD_MODELS=0
 /workspace 디렉터리 생성
 → SSH 서버 시작
 → 업로드 Web UI 시작
+→ Jupyter Lab 시작
 → 모델 존재 여부와 무결성 검사
 → 없거나 손상된 모델 다운로드
 → sleep infinity로 컨테이너 유지
@@ -124,10 +143,12 @@ AUTO_DOWNLOAD_MODELS=0
 ```text
 SSH server started on container port 22.
 Upload Web UI started: port=7860 path=/upload directory=/workspace/dataset
+Jupyter Lab started: port=8888 token=<생성된 토큰>
+Access URL: http://<host>:8888/lab?token=<생성된 토큰>
 Model preparation complete: /workspace/models
 ```
 
-모델 다운로드가 실패해도 SSH와 Web UI는 계속 실행됩니다.
+모델 다운로드가 실패해도 SSH, Web UI, Jupyter Lab은 계속 실행됩니다.
 
 ---
 
@@ -265,6 +286,8 @@ ssh root@<PUBLIC_IP> -p <EXTERNAL_SSH_PORT>
 
 컨테이너 내부 SSH 포트는 `22`입니다. RunPod가 외부 포트를 별도로 할당할 수 있으므로 무조건 `-p 22`를 쓰면 안 됩니다.
 
+SSH로 접속하면 자동으로 `/opt/venv`가 활성화되고 `tmux` 세션(`main`)에 붙습니다(연결이 끊겨도 작업이 유지됩니다). `btop`은 `--utf-force`가 alias로 적용되어 있어 그냥 `btop`만 입력하면 됩니다.
+
 SSH 상태 확인:
 
 ```bash
@@ -288,7 +311,7 @@ cat /root/.ssh/authorized_keys
 /opt/AnimaLoraToolkit/config/runpod-docker.yaml
 ```
 
-직접 수정하지 말고 `/workspace`에 복사합니다.
+컨테이너가 처음 시작될 때 `/workspace/my_character.yaml`이 없으면 자동으로 복사되고, 모델 다운로드 후 검사(`validate-anima-training`)까지 자동 실행됩니다(학습은 자동으로 시작되지 않습니다). 데이터셋 업로드 전이라면 이 검사는 실패하는 게 정상이니 무시하고 데이터셋을 올린 뒤 직접 다시 실행하면 됩니다. 직접 복사하려면:
 
 ```bash
 cp /opt/AnimaLoraToolkit/config/runpod-docker.yaml \
@@ -377,9 +400,33 @@ TRAIN_CONFIG=/workspace/my_character.yaml train-runpod
 모델 확인 및 누락 파일 다운로드
 → 학습 전 검사
 → anima_train.py 실행
+→ 설정 확인/수정 TUI 표시 (주요 설정값 검토)
 → Rich 진행 화면 표시
 → 동일 출력을 로그에 저장
 ```
+
+## 설정 확인/수정 TUI
+
+학습이 실제로 시작되기 전에 주요 설정값을 표로 보여주고 그 자리에서 수정할 수 있습니다.
+
+- **번호 입력** → 해당 설정 수정 (원하는 순서로 왔다갔다 수정 가능)
+- **Enter 또는 `s`** → 현재 값으로 학습 시작
+- **`e`** → 현재 적용값을 YAML로 export
+- **`q`** → 취소
+
+기본값은 `my_character.yaml`(및 CLI 인자)에서 읽은 값이며, 화면에 각 설정의 짧은 설명이 함께 표시됩니다. 학습이 시작되면 최종 적용값이 항상 `/workspace/output/applied_config_<시각>.yaml`로 자동 저장되어 재현이 가능합니다.
+
+확인 없이 바로 시작하려면 `-y`(또는 `--yes`)를 붙입니다.
+
+```bash
+TRAIN_CONFIG=/workspace/my_character.yaml train-runpod -y
+```
+
+주요 설정 외에 이번에 노출된 항목:
+
+- `timestep_shift` (기본 3.0): 학습 노이즈 분포 편향. 낮출수록(예: 1.0) 세부 디테일 비중↑.
+- `train_llm_adapter` (기본 true): llm_adapter에도 LoRA를 넣을지. `false`로 두면 "트리거를 넣으면 구도가 통째로 딸려오는" 현상 완화에 도움될 수 있습니다.
+- `tag_dropout`: 이제 TXT 캡션에서도 실제로 동작합니다(이전에는 JSON 전용).
 
 로그 위치:
 

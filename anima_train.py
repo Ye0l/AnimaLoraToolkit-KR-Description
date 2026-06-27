@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import types
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -130,7 +131,9 @@ def apply_yaml_config(args, config):
         "lora_alpha": "lora_alpha",
         "lokr_factor": "lokr_factor",
         "resume_lora": "resume_lora",
+        "train_llm_adapter": "train_llm_adapter",
         # 训练参数
+        "timestep_shift": "timestep_shift",
         "epochs": "epochs",
         "max_steps": "max_steps",
         "batch_size": "batch_size",
@@ -191,6 +194,8 @@ def apply_yaml_config(args, config):
         "lora_alpha": 32.0,
         "lokr_factor": 8,
         "resume_lora": "",
+        "train_llm_adapter": True,
+        "timestep_shift": 3.0,
         "epochs": 10,
         "max_steps": 0,
         "batch_size": 1,
@@ -368,7 +373,7 @@ def enable_xformers(model):
     try:
         from xformers.ops import memory_efficient_attention
     except ImportError:
-        logger.warning("xformers 未安装，跳过启用")
+        logger.warning("xformers not installed; skipping enable")
         return False
 
     enabled_count = 0
@@ -382,11 +387,11 @@ def enable_xformers(model):
             enabled_count += 1
 
     if enabled_count > 0:
-        logger.info(f"xformers 已启用: {enabled_count} 个模块")
+        logger.info(f"xformers enabled: {enabled_count} module(s)")
         return True
 
     # 如果模型没有内置支持，尝试 monkey patch
-    logger.info("xformers 已加载，将在 attention 计算中使用")
+    logger.info("xformers loaded; will be used in attention computation")
     return True
 
 
@@ -406,7 +411,7 @@ def find_diffusion_pipe_root():
             return candidate
         if candidate and (candidate / "models" / "anima_modeling.py").exists():
             return candidate / "models"
-    raise RuntimeError("找不到 anima_modeling.py，请设置 DIFFUSION_PIPE_ROOT 或放置模型代码")
+    raise RuntimeError("anima_modeling.py not found. Set DIFFUSION_PIPE_ROOT or place the model code accordingly.")
 
 
 def load_module_from_path(module_name, file_path):
@@ -541,7 +546,7 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
     remap_name = "+".join(prefixes) if prefixes else "none"
 
     logger.info(
-        f"{label} 权重加载: remap={remap_name}, 匹配 {matched_after}/{len(model_keys)} ({coverage:.1%}), "
+        f"{label} weights loaded: remap={remap_name}, matched {matched_after}/{len(model_keys)} ({coverage:.1%}), "
         f"missing={len(missing)}, unexpected={len(unexpected)}"
     )
 
@@ -551,9 +556,10 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
     if coverage < 0.60 or len(critical_missing) > 0:
         preview_missing = ", ".join(critical_missing[:8])
         raise RuntimeError(
-            f"{label} 权重看起来没有正确加载（remap={remap_name}, coverage={coverage:.1%}）。"
-            f"关键参数缺失: {preview_missing or 'N/A'}。\n"
-            f"这通常表示你选错了 .safetensors（不是完整 transformer/vae 权重），或 checkpoint key 前缀不匹配。"
+            f"{label} weights do not look correctly loaded (remap={remap_name}, coverage={coverage:.1%}). "
+            f"Missing critical parameters: {preview_missing or 'N/A'}.\n"
+            f"This usually means you picked the wrong .safetensors (not a complete transformer/vae checkpoint), "
+            f"or the checkpoint key prefix doesn't match."
         )
     return {
         "remap": remap_name,
@@ -604,7 +610,7 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     elif model_channels == 5120:
         num_blocks, num_heads = 36, 40
     else:
-        raise RuntimeError(f"未知的 model_channels={model_channels}")
+        raise RuntimeError(f"Unknown model_channels={model_channels}")
 
     config = dict(
         max_img_h=240, max_img_w=240, max_frames=128,
@@ -633,13 +639,13 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     if not has_llm_adapter and hasattr(model, "llm_adapter"):
         try:
             model.llm_adapter = None
-            logger.warning("检测到 checkpoint 不包含 llm_adapter 权重：已禁用 llm_adapter（回退为直接使用 Qwen embeddings）")
+            logger.warning("Detected checkpoint without llm_adapter weights: llm_adapter disabled (falling back to direct Qwen embeddings)")
         except Exception:
             pass
     model = model.to(device=device, dtype=dtype)
     model.requires_grad_(False)
 
-    logger.info(f"Anima 模型加载完成: {model_channels}ch, {num_blocks} blocks")
+    logger.info(f"Anima model loaded: {model_channels}ch, {num_blocks} blocks")
     return model
 
 
@@ -679,7 +685,7 @@ def load_vae(vae_path, device, dtype, repo_root):
     wrapper.std = std
     wrapper.scale = [mean, 1.0 / std]
 
-    logger.info("VAE 加载完成")
+    logger.info("VAE loaded")
     return wrapper
 
 
@@ -699,7 +705,7 @@ def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     else:
         t5_tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
 
-    logger.info("文本编码器加载完成")
+    logger.info("Text encoder loaded")
     return qwen_model, qwen_tokenizer, t5_tokenizer
 
 
@@ -1077,21 +1083,28 @@ class LoRAInjector:
     """LoRA 注入器"""
     DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "output_proj", "mlp.layer1", "mlp.layer2"]
 
-    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None):
+    def __init__(self, rank=32, alpha=16.0, dropout=0.0, use_lokr=False, factor=8, targets=None,
+                 train_llm_adapter=True):
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.use_lokr = use_lokr
         self.factor = factor
         self.targets = targets or self.DEFAULT_TARGETS
+        self.train_llm_adapter = train_llm_adapter
         self.injected = {}
 
     def inject(self, model):
         """注入 LoRA 到模型"""
+        skipped_llm_adapter = 0
         for name, module in list(model.named_modules()):
             if not isinstance(module, torch.nn.Linear):
                 continue
             if not any(t in name for t in self.targets):
+                continue
+            # llm_adapter 把提示词转成图像条件；同时训练它容易让触发词和构图纠缠在一起
+            if not self.train_llm_adapter and name.startswith("llm_adapter."):
+                skipped_llm_adapter += 1
                 continue
 
             lora_linear = LoRALinear(
@@ -1107,7 +1120,9 @@ class LoRAInjector:
             setattr(parent, parts[-1], lora_linear)
             self.injected[name] = lora_linear
 
-        logger.info(f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层")
+        logger.info(f"Injected {'LoKr' if self.use_lokr else 'LoRA'} into {len(self.injected)} layers")
+        if skipped_llm_adapter:
+            logger.info(f"Skipped llm_adapter layers (train_llm_adapter=False): {skipped_llm_adapter}")
         return self.injected
 
     def get_params(self):
@@ -1144,13 +1159,13 @@ class LoRAInjector:
             "ss_network_args": f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}",
         }
         save_file(sd, path, metadata=meta)
-        logger.info(f"LoRA 保存到: {path}")
+        logger.info(f"LoRA saved to: {path}")
 
     def load(self, path):
         """从 safetensors 加载已有 LoRA 权重（用于继续训练）"""
         from safetensors import safe_open
         
-        logger.info(f"加载已有 LoRA 权重: {path}")
+        logger.info(f"Loaded existing LoRA weights: {path}")
         
         # 读取权重
         sd = {}
@@ -1177,7 +1192,7 @@ class LoRAInjector:
                     lora.adapter.lora_up.weight.data.copy_(sd[up_key])
                     loaded_count += 1
         
-        logger.info(f"从 checkpoint 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
+        logger.info(f"Loaded {loaded_count}/{len(self.injected)} LoRA layers from checkpoint")
 
 
 # ============================================================================
@@ -1200,12 +1215,12 @@ def save_training_state(path, injector, optimizer, epoch, global_step, loss_hist
         "monitor_state": monitor_state,  # 保存监控面板数据（用于恢复 loss 曲线）
     }
     torch.save(state, path)
-    logger.info(f"训练状态已保存: {path} (epoch={epoch}, step={global_step})")
+    logger.info(f"Training state saved: {path} (epoch={epoch}, step={global_step})")
 
 
 def load_training_state(path, injector, optimizer):
     """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state)"""
-    logger.info(f"加载训练状态: {path}")
+    logger.info(f"Loading training state: {path}")
     state = torch.load(path, map_location="cpu", weights_only=False)
     
     # 加载 LoRA 权重
@@ -1243,7 +1258,7 @@ def load_training_state(path, injector, optimizer):
     loss_history = state.get("loss_history", [])
     monitor_state = state.get("monitor_state", None)  # 恢复监控数据
     
-    logger.info(f"训练状态已恢复: epoch={epoch}, step={global_step}")
+    logger.info(f"Training state restored: epoch={epoch}, step={global_step})")
     return epoch, global_step, loss_history, monitor_state
 
 
@@ -1324,25 +1339,26 @@ class ImageDataset(Dataset):
                         "normalize": caption_module.normalize_caption_json,
                         "build": caption_module.build_caption_from_json,
                     }
-                    logger.info("JSON caption 模式已启用（分类 shuffle）")
+                    logger.info("JSON caption mode enabled (category shuffle)")
                 else:
-                    logger.warning(f"caption_utils.py 未找到: {utils_path}")
+                    logger.warning(f"caption_utils.py not found: {utils_path}")
             except Exception as e:
-                logger.warning(f"caption_utils 加载失败: {e}，回退到 TXT 模式")
+                logger.warning(f"Failed to load caption_utils: {e}; falling back to TXT mode")
         
         self.samples = self._scan()
         json_count = sum(1 for s in self.samples if s.get("json_path"))
         txt_count = len(self.samples) - json_count
-        logger.info(f"数据集: {len(self.samples)} 样本 (JSON: {json_count}, TXT: {txt_count})")
+        logger.info(f"Dataset: {len(self.samples)} samples (JSON: {json_count}, TXT: {txt_count})")
 
     def _scan(self):
+        from PIL import Image
         samples = []
         for img_path in self.data_dir.rglob("*"):
             if img_path.suffix.lower() not in self.EXTS:
                 continue
-            
+
             sample = {"image": img_path}
-            
+
             # 优先查找 JSON
             json_path = img_path.with_suffix(".json")
             if self.prefer_json and json_path.exists():
@@ -1357,12 +1373,20 @@ class ImageDataset(Dataset):
                     continue
                 sample["json_path"] = None
                 sample["txt_path"] = txt_path
-            
+
+            # 预先计算分桶尺寸（仅读取图像头，不解码像素），用于按桶分批
+            with Image.open(img_path) as im:
+                w, h = im.size
+            if self.bucket_mgr:
+                sample["bucket"] = self.bucket_mgr.get_bucket(w, h)
+            else:
+                sample["bucket"] = (self.resolution, self.resolution)
+
             samples.append(sample)
         return samples
 
     def _process_caption_txt(self, caption):
-        """处理 TXT caption: 传统 tag 打乱 + keep_tokens"""
+        """处理 TXT caption: 传统 tag 打乱 + keep_tokens + tag_dropout"""
         if not caption:
             return ""
         if "," in caption:
@@ -1370,16 +1394,18 @@ class ImageDataset(Dataset):
         else:
             tags = caption.split()
 
-        if self.keep_tokens > 0:
-            kept = tags[:self.keep_tokens]
-            rest = tags[self.keep_tokens:]
-            if self.shuffle_caption:
-                random.shuffle(rest)
-            tags = kept + rest
-        elif self.shuffle_caption:
-            random.shuffle(tags)
+        kept = tags[:self.keep_tokens] if self.keep_tokens > 0 else []
+        rest = tags[self.keep_tokens:] if self.keep_tokens > 0 else tags
 
-        return ", ".join(tags)
+        # tag_dropout: 随机丢弃部分标签（保留 keep_tokens 不动），增强泛化、减弱构图固化
+        if self.tag_dropout > 0 and rest:
+            rest = [t for t in rest if random.random() >= self.tag_dropout]
+
+        if self.shuffle_caption:
+            random.shuffle(rest)
+
+        tags = kept + rest
+        return ", ".join(t for t in tags if t)
 
     def _process_caption_json(self, json_path):
         """处理 JSON caption: 分类 shuffle"""
@@ -1406,7 +1432,7 @@ class ImageDataset(Dataset):
                 tag_dropout=self.tag_dropout,
             )
         except Exception as e:
-            logger.warning(f"JSON 处理失败 {json_path}: {e}")
+            logger.warning(f"JSON processing failed {json_path}: {e}")
             return None
 
     def __len__(self):
@@ -1430,11 +1456,8 @@ class ImageDataset(Dataset):
         if caption is None:
             caption = ""
 
-        # ARB 分桶
-        if self.bucket_mgr:
-            tw, th = self.bucket_mgr.get_bucket(img.width, img.height)
-        else:
-            tw = th = self.resolution
+        # ARB 分桶（使用扫描阶段缓存的分桶尺寸，保证与 BucketBatchSampler 一致）
+        tw, th = sample.get("bucket", (self.resolution, self.resolution))
 
         # 缩放裁剪
         scale = max(tw / img.width, th / img.height)
@@ -1493,27 +1516,39 @@ class CachedLatentDataset(Dataset):
         img_path = Path(img_path)
         return img_path.with_suffix(".npz")
 
-    def _is_cache_valid(self, img_path, npz_path):
-        """检查缓存是否有效（图像未修改）"""
+    def _is_cache_valid(self, img_path, npz_path, bucket):
+        """检查缓存是否有效（图像未修改，且分桶尺寸与当前一致）。
+
+        仅比较 mtime 不够：分辨率/分桶配置变了之后，旧 npz 仍然比图片新，
+        但里面缓存的 latent 尺寸跟这次的目标桶不一致，会在同一批次里和
+        其他正确尺寸的样本 stack 失败。所以额外存了 bucket 尺寸用于校验。
+        """
         if not npz_path.exists():
             return False
-        return npz_path.stat().st_mtime >= img_path.stat().st_mtime
+        if npz_path.stat().st_mtime < img_path.stat().st_mtime:
+            return False
+        try:
+            with self.np.load(npz_path) as data:
+                cached_bucket = tuple(int(v) for v in data["bucket"])
+        except Exception:
+            return False
+        return cached_bucket == tuple(bucket)
 
     def _build_cache(self, vae, device, dtype):
         """构建/加载 npz 缓存"""
-        logger.info("检查 VAE latent 缓存...")
+        logger.info("Checking VAE latent cache...")
         to_encode = []
         for i, sample in enumerate(self.samples):
             img_path = sample["image"]
             npz_path = self._get_npz_path(img_path)
-            if not self._is_cache_valid(img_path, npz_path):
+            if not self._is_cache_valid(img_path, npz_path, sample["bucket"]):
                 to_encode.append(i)
 
         if to_encode:
-            logger.info(f"需要编码 {len(to_encode)}/{len(self.samples)} 张图像...")
+            logger.info(f"Need to encode {len(to_encode)}/{len(self.samples)} images...")
             self._encode_and_save(to_encode, vae, device, dtype)
         else:
-            logger.info(f"所有 {len(self.samples)} 张图像已缓存")
+            logger.info(f"All {len(self.samples)} images already cached")
 
     def _encode_and_save(self, indices, vae, device, dtype):
         """编码图像并保存为 npz"""
@@ -1525,9 +1560,9 @@ class CachedLatentDataset(Dataset):
                 latent = vae.model.encode(pixels_5d, vae.scale)
             latent_np = latent.squeeze(0).cpu().float().numpy()
             npz_path = self._get_npz_path(self.samples[i]["image"])
-            self.np.savez(npz_path, latent=latent_np)
+            self.np.savez(npz_path, latent=latent_np, bucket=self.np.array(self.samples[i]["bucket"]))
             if (count + 1) % 10 == 0 or count == len(indices) - 1:
-                logger.info(f"  编码进度: {count + 1}/{len(indices)}")
+                logger.info(f"  Encoding progress: {count + 1}/{len(indices)}")
 
     def __len__(self):
         return len(self.samples)
@@ -1629,7 +1664,7 @@ def sample_image(
     # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
     lat_h, lat_w = height // 8, width // 8
     if str(scheduler).lower() != "simple":
-        logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
+        logger.warning(f"Sampling scheduler={scheduler} not implemented; falling back to simple")
     sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
 
     # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
@@ -1693,12 +1728,53 @@ def sample_image(
 # 训练辅助
 # ============================================================================
 
-def sample_t(bs, device):
-    """采样时间步 (logit-normal)"""
+def sample_t(bs, device, shift=3.0):
+    """采样时间步 (logit-normal)。shift 越大越偏向高噪声（结构/构图）区间。"""
     t = torch.sigmoid(torch.randn(bs, device=device))
-    shift = 3.0
-    t = (t * shift) / (1 + (shift - 1) * t)
+    if shift != 1.0:
+        t = (t * shift) / (1 + (shift - 1) * t)
     return t
+
+
+class BucketBatchSampler(torch.utils.data.Sampler):
+    """按 ARB 分桶分组的 batch sampler，确保同一批次内图像尺寸一致。"""
+
+    def __init__(self, bucket_keys, batch_size, shuffle=True, drop_last=False):
+        self.bucket_keys = bucket_keys
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+    def _batches(self):
+        by_bucket = defaultdict(list)
+        for idx, key in enumerate(self.bucket_keys):
+            by_bucket[key].append(idx)
+
+        batches = []
+        for indices in by_bucket.values():
+            if self.shuffle:
+                random.shuffle(indices)
+            for i in range(0, len(indices), self.batch_size):
+                chunk = indices[i:i + self.batch_size]
+                if self.drop_last and len(chunk) < self.batch_size:
+                    continue
+                batches.append(chunk)
+
+        if self.shuffle:
+            random.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches())
+
+    def __len__(self):
+        counts = defaultdict(int)
+        for key in self.bucket_keys:
+            counts[key] += 1
+        total = 0
+        for count in counts.values():
+            total += (count // self.batch_size) if self.drop_last else -(-count // self.batch_size)
+        return total
 
 
 def collate_fn(batch):
@@ -1759,6 +1835,12 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=32.0)
     p.add_argument("--lokr-factor", type=int, default=8)
     p.add_argument("--resume-lora", default="", help="从已有 LoRA 继续训练（safetensors 路径）")
+    p.add_argument("--train-llm-adapter", action=argparse.BooleanOptionalAction, default=True,
+                   help="是否给 llm_adapter 也注入 LoRA（关掉可减弱触发词和构图的纠缠）")
+
+    # 高级训练参数
+    p.add_argument("--timestep-shift", type=float, default=3.0,
+                   help="训练时间步采样的 shift（越大越偏结构/构图，越小越偏细节，1.0=不偏置）")
 
     # 采样参数
     p.add_argument("--sample-every", type=int, default=0, help="每 N 个 epoch 采样一次 (0=禁用)")
@@ -1792,6 +1874,8 @@ def parse_args():
     # 依赖和交互
     p.add_argument("--auto-install", action="store_true", help="自动安装缺失依赖")
     p.add_argument("--interactive", action="store_true", help="交互模式，提示输入缺失参数")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="跳过启动时的配置确认 TUI，直接用当前配置开始训练")
 
     return p.parse_args()
 
@@ -1893,7 +1977,7 @@ def main():
     config_path = None
     config_dir = None
     if args.config:
-        logger.info(f"加载配置文件: {args.config}")
+        logger.info(f"Loading config file: {args.config}")
         config_path = Path(args.config).resolve()
         config_dir = config_path.parent
         config = load_yaml_config(args.config)
@@ -1909,6 +1993,15 @@ def main():
     required = [args.data_dir, args.transformer, args.vae, args.qwen]
     if args.interactive or any(not x for x in required):
         args = prompt_for_args(args)
+
+    # 启动前的配置确认/修改 TUI（--yes 或非交互终端时跳过；总是导出最终配置快照）
+    try:
+        from train_config_tui import maybe_run_tui
+        args = maybe_run_tui(args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.warning(f"Config TUI unavailable, continuing with current config: {e}")
 
     # 依赖检测
     ensure_dependencies(auto_install=args.auto_install)
@@ -1954,11 +2047,11 @@ def main():
                 "data_dir": str(args.data_dir),
             })
         except Exception as e:
-            logger.warning(f"监控面板启动失败: {e}")
+            logger.warning(f"Monitor dashboard failed to start: {e}")
 
     # 查找模型代码
     repo_root = find_diffusion_pipe_root()
-    logger.info(f"模型代码路径: {repo_root}")
+    logger.info(f"Model code path: {repo_root}")
 
     # 解析路径：相对路径优先按 config 位置 / AnimaLoraToolkit 目录解析
     script_dir = Path(__file__).resolve().parent
@@ -1978,35 +2071,36 @@ def main():
     args.data_dir = resolve_path_best_effort(args.data_dir, bases)
 
     # 加载模型
-    logger.info("加载 Transformer...")
+    logger.info("Loading transformer...")
     model = load_anima_model(args.transformer, device, dtype, repo_root)
 
     # 启用 xformers
     if args.xformers:
         enable_xformers(model)
 
-    logger.info("加载 VAE...")
+    logger.info("Loading VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
 
-    logger.info("加载文本编码器...")
+    logger.info("Loading text encoder...")
     qwen_model, qwen_tok, t5_tok = load_text_encoders(
         args.qwen, args.t5_tokenizer, device, dtype
     )
 
     # 注入 LoRA
-    logger.info(f"注入 {args.lora_type.upper()}...")
+    logger.info(f"Injecting {args.lora_type.upper()}...")
     injector = LoRAInjector(
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         use_lokr=(args.lora_type == "lokr"),
         factor=args.lokr_factor,
+        train_llm_adapter=getattr(args, "train_llm_adapter", True),
     )
     injector.inject(model)
     
     # 从已有 LoRA 继续训练
     if getattr(args, "resume_lora", "") and Path(args.resume_lora).exists():
         injector.load(args.resume_lora)
-        logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
+        logger.info(f"Resuming training from existing LoRA: {args.resume_lora}")
 
     # 数据集
     bucket_mgr = BucketManager(args.resolution)
@@ -2030,12 +2124,19 @@ def main():
         dataset = RepeatDataset(dataset, repeats=args.repeats)
 
     if args.num_workers > 0 and os.name == "nt":
-        logger.warning("num_workers > 0 在 Windows 上容易崩溃：已强制设为 0（避免多进程 spawn 问题）")
+        logger.warning("num_workers > 0 is prone to crashing on Windows: forced to 0 (avoids multiprocessing spawn issues)")
         args.num_workers = 0
 
+    # 按分桶分组的 batch sampler：保证同一批次内图像/latent 尺寸一致，
+    # 否则不同长宽比图像混入同一批会导致 torch.stack 报错。
+    base_len = len(base_dataset)
+    base_bucket_keys = [s["bucket"] for s in base_dataset.samples]
+    bucket_keys = [base_bucket_keys[i % base_len] for i in range(len(dataset))]
+    batch_sampler = BucketBatchSampler(bucket_keys, args.batch_size, shuffle=True)
+
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size,
-        shuffle=True,
+        dataset,
+        batch_sampler=batch_sampler,
         collate_fn=collate_fn_cached if use_cached else collate_fn,
         num_workers=args.num_workers
     )
@@ -2051,9 +2152,9 @@ def main():
                 recon0 = (recon0.clamp(-1, 1) + 1) / 2
             arr0 = (recon0[0].permute(1, 2, 0).detach().cpu().float().numpy() * 255).clip(0, 255).astype("uint8")
             Image.fromarray(arr0).save(sample_dir / "vae_roundtrip.png")
-            logger.info("VAE roundtrip 自检已保存: samples/vae_roundtrip.png")
+            logger.info("VAE roundtrip self-test saved: samples/vae_roundtrip.png")
     except Exception as e:
-        logger.warning(f"VAE roundtrip 自检失败（若 sample 仍是噪点，请优先修这个）: {e}")
+        logger.warning(f"VAE roundtrip self-test failed (if samples are still noise, fix this first): {e}")
 
     # 优化器
     params = injector.get_params()
@@ -2072,7 +2173,7 @@ def main():
     else:
         total_steps = None
 
-    logger.info(f"数据集大小: {len(dataset)}, 每 epoch 步数: {steps_per_epoch}, 总步数: {total_steps}")
+    logger.info(f"Dataset size: {len(dataset)}, steps per epoch: {steps_per_epoch}, total steps: {total_steps}")
 
     # 初始化进度显示
     progress, task_id, progress_kind = init_progress(not args.no_progress, total_steps)
@@ -2115,7 +2216,7 @@ def main():
         start_epoch, global_step, loss_history, saved_monitor_state = load_training_state(
             args.resume_state, injector, optimizer
         )
-        emit(f"从断点恢复训练: epoch={start_epoch}, step={global_step}")
+        emit(f"Resuming training from checkpoint: epoch={start_epoch}, step={global_step}")
         
         # 恢复监控面板的历史数据（loss 曲线等）
         if monitor_server and saved_monitor_state:
@@ -2128,19 +2229,19 @@ def main():
                     step=global_step,
                     total_steps=total_steps,
                 )
-                emit(f"监控面板历史数据已恢复: {len(saved_monitor_state.get('losses', []))} 个 loss 点")
+                emit(f"Monitor dashboard history restored: {len(saved_monitor_state.get('losses', []))} loss point(s)")
             except Exception as e:
-                emit(f"监控数据恢复失败: {e}")
+                emit(f"Failed to restore monitor data: {e}")
     
     # Ctrl+C 信号处理：保存状态后退出
     interrupted = False
     def signal_handler(sig, frame):
         nonlocal interrupted
         if interrupted:
-            emit("强制退出...")
+            emit("Force quitting...")
             sys.exit(1)
         interrupted = True
-        emit("\n检测到 Ctrl+C，正在保存训练状态...")
+        emit("\nCtrl+C detected; saving training state...")
         state_path = output_dir / f"training_state_step{global_step}.pt"
         # 获取监控面板数据用于恢复 loss 曲线
         monitor_data = None
@@ -2154,7 +2255,7 @@ def main():
         # 同时保存 LoRA 权重
         lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
         injector.save(lora_path)
-        emit(f"已保存！下次使用 --resume-state \"{state_path}\" 继续训练")
+        emit(f"Saved! Resume training next time with --resume-state \"{state_path}\"")
         sys.exit(0)
     
     import signal
@@ -2183,7 +2284,7 @@ def main():
     # 只在新训练时执行（global_step == 0），resume 时跳过
     sampling_enabled = args.sample_steps > 0 or args.sample_every > 0
     if global_step == 0 and sampling_enabled:
-        emit("采样中 (step 0, 基线)...")
+        emit("Sampling (step 0, baseline)...")
         model.eval()
         s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
         s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2206,7 +2307,7 @@ def main():
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
-            emit(f"基线采样保存: step_0_baseline_{i}.png")
+            emit(f"Baseline sample saved: step_0_baseline_{i}.png")
             if monitor_server:
                 try:
                     update_monitor(sample_path=sample_path)
@@ -2214,7 +2315,7 @@ def main():
                     pass
         model.train()
     elif global_step > 0 and sampling_enabled:
-        emit(f"跳过启动基线采样（从 step {global_step} 恢复，非 step 0）")
+        emit(f"Skipping startup baseline sampling (resumed from step {global_step}, not step 0)")
 
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
@@ -2250,7 +2351,7 @@ def main():
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
 
             # Flow Matching
-            t = sample_t(bs, device)
+            t = sample_t(bs, device, shift=getattr(args, "timestep_shift", 3.0))
             t_exp = t.view(-1, 1, 1, 1, 1)
             noise = torch.randn_like(latents)
             noisy = (1 - t_exp) * latents + t_exp * noise
@@ -2314,7 +2415,7 @@ def main():
                 if args.sample_steps > 0 and global_step % args.sample_steps == 0:
                     prompt = get_next_sample_prompt()
                     prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                    emit(f"采样中 (step {global_step}): {prompt_short}")
+                    emit(f"Sampling (step {global_step}): {prompt_short}")
                     model.eval()
                     s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
                     s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2333,7 +2434,7 @@ def main():
                     )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
-                    emit(f"采样保存: step_{global_step}.png")
+                    emit(f"Sample saved: step_{global_step}.png")
                     if monitor_server:
                         try:
                             update_monitor(sample_path=sample_path)
@@ -2382,7 +2483,7 @@ def main():
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:
                 prompt = get_next_sample_prompt()
                 prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                emit(f"采样中 (epoch {current_epoch}): {prompt_short}")
+                emit(f"Sampling (epoch {current_epoch}): {prompt_short}")
                 model.eval()
                 s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
                 s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2401,7 +2502,7 @@ def main():
                 )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)
-                emit(f"采样保存: epoch_{current_epoch}.png")
+                emit(f"Sample saved: epoch_{current_epoch}.png")
                 model.train()
                 
                 # 更新监控面板
@@ -2431,7 +2532,7 @@ def main():
         emit(f"Loss curve (first {len(loss_history)} steps):\n{chart}")
 
     emit(f"Saved final LoRA: {final_path}")
-    logger.info("训练完成!")
+    logger.info("Training complete!")
 
 
 if __name__ == "__main__":

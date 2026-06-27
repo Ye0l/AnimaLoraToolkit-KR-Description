@@ -11,6 +11,8 @@ from pathlib import Path
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/workspace/models"))
+
 def test_t5_tokenizer():
     """测试 T5 tokenizer 加载"""
     print("=" * 60)
@@ -19,7 +21,7 @@ def test_t5_tokenizer():
     
     from transformers import T5Tokenizer
     
-    t5_path = Path(__file__).parent / "models" / "t5_tokenizer"
+    t5_path = MODEL_DIR / "t5_tokenizer"
     print(f"   Path: {t5_path}")
     
     try:
@@ -44,7 +46,7 @@ def test_qwen_tokenizer():
     
     from transformers import AutoTokenizer
     
-    qwen_path = Path(__file__).parent / "models" / "text_encoders"
+    qwen_path = MODEL_DIR / "text_encoders"
     print(f"   Path: {qwen_path}")
     
     try:
@@ -74,7 +76,7 @@ def test_qwen_model():
     import torch
     from transformers import AutoModelForCausalLM
     
-    qwen_path = Path(__file__).parent / "models" / "text_encoders"
+    qwen_path = MODEL_DIR / "text_encoders"
     print(f"   Path: {qwen_path}")
     
     try:
@@ -106,9 +108,8 @@ def test_encode_workflow():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
     
-    base_path = Path(__file__).parent / "models"
-    qwen_path = base_path / "text_encoders"
-    t5_path = base_path / "t5_tokenizer"
+    qwen_path = MODEL_DIR / "text_encoders"
+    t5_path = MODEL_DIR / "t5_tokenizer"
     
     try:
         # 加载 tokenizers

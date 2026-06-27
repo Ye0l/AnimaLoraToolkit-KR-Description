@@ -81,13 +81,17 @@ jobs:
             -e WEBUI_ENABLED=1 \
             -e WEBUI_USER=runpod \
             -e WEBUI_PASSWORD=smoke-test \
+            -e JUPYTER_ENABLED=1 \
+            -e JUPYTER_TOKEN=smoke-test \
             -p 12222:22 \
             -p 17860:7860 \
+            -p 18888:8888 \
             animalora-runpod:smoke
 
           wait_for_services() {
             local web_ok=0
             local ssh_ok=0
+            local jupyter_ok=0
             for _ in $(seq 1 80); do
               if curl --fail --silent --show-error \
                 --user runpod:smoke-test \
@@ -104,7 +108,11 @@ jobs:
                 root@127.0.0.1 true; then
                 ssh_ok=1
               fi
-              if [[ "$web_ok" == 1 && "$ssh_ok" == 1 ]]; then
+              if curl --fail --silent --show-error \
+                http://127.0.0.1:18888/login >/dev/null; then
+                jupyter_ok=1
+              fi
+              if [[ "$web_ok" == 1 && "$ssh_ok" == 1 && "$jupyter_ok" == 1 ]]; then
                 return 0
               fi
               sleep 0.5
