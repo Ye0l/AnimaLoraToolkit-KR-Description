@@ -1516,11 +1516,23 @@ class CachedLatentDataset(Dataset):
         img_path = Path(img_path)
         return img_path.with_suffix(".npz")
 
-    def _is_cache_valid(self, img_path, npz_path):
-        """检查缓存是否有效（图像未修改）"""
+    def _is_cache_valid(self, img_path, npz_path, bucket):
+        """检查缓存是否有效（图像未修改，且分桶尺寸与当前一致）。
+
+        仅比较 mtime 不够：分辨率/分桶配置变了之后，旧 npz 仍然比图片新，
+        但里面缓存的 latent 尺寸跟这次的目标桶不一致，会在同一批次里和
+        其他正确尺寸的样本 stack 失败。所以额外存了 bucket 尺寸用于校验。
+        """
         if not npz_path.exists():
             return False
-        return npz_path.stat().st_mtime >= img_path.stat().st_mtime
+        if npz_path.stat().st_mtime < img_path.stat().st_mtime:
+            return False
+        try:
+            with self.np.load(npz_path) as data:
+                cached_bucket = tuple(int(v) for v in data["bucket"])
+        except Exception:
+            return False
+        return cached_bucket == tuple(bucket)
 
     def _build_cache(self, vae, device, dtype):
         """构建/加载 npz 缓存"""
@@ -1529,7 +1541,7 @@ class CachedLatentDataset(Dataset):
         for i, sample in enumerate(self.samples):
             img_path = sample["image"]
             npz_path = self._get_npz_path(img_path)
-            if not self._is_cache_valid(img_path, npz_path):
+            if not self._is_cache_valid(img_path, npz_path, sample["bucket"]):
                 to_encode.append(i)
 
         if to_encode:
@@ -1548,7 +1560,7 @@ class CachedLatentDataset(Dataset):
                 latent = vae.model.encode(pixels_5d, vae.scale)
             latent_np = latent.squeeze(0).cpu().float().numpy()
             npz_path = self._get_npz_path(self.samples[i]["image"])
-            self.np.savez(npz_path, latent=latent_np)
+            self.np.savez(npz_path, latent=latent_np, bucket=self.np.array(self.samples[i]["bucket"]))
             if (count + 1) % 10 == 0 or count == len(indices) - 1:
                 logger.info(f"  Encoding progress: {count + 1}/{len(indices)}")
 
