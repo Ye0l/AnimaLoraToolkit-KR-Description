@@ -265,6 +265,8 @@ ssh root@<PUBLIC_IP> -p <EXTERNAL_SSH_PORT>
 
 컨테이너 내부 SSH 포트는 `22`입니다. RunPod가 외부 포트를 별도로 할당할 수 있으므로 무조건 `-p 22`를 쓰면 안 됩니다.
 
+SSH로 접속하면 자동으로 `/opt/venv`가 활성화되고 `tmux` 세션(`main`)에 붙습니다(연결이 끊겨도 작업이 유지됩니다). `btop`은 `--utf-force`가 alias로 적용되어 있어 그냥 `btop`만 입력하면 됩니다.
+
 SSH 상태 확인:
 
 ```bash
@@ -288,7 +290,7 @@ cat /root/.ssh/authorized_keys
 /opt/AnimaLoraToolkit/config/runpod-docker.yaml
 ```
 
-직접 수정하지 말고 `/workspace`에 복사합니다.
+컨테이너가 처음 시작될 때 `/workspace/my_character.yaml`이 없으면 자동으로 복사되고, 모델 다운로드 후 검사(`validate-anima-training`)까지 자동 실행됩니다(학습은 자동으로 시작되지 않습니다). 데이터셋 업로드 전이라면 이 검사는 실패하는 게 정상이니 무시하고 데이터셋을 올린 뒤 직접 다시 실행하면 됩니다. 직접 복사하려면:
 
 ```bash
 cp /opt/AnimaLoraToolkit/config/runpod-docker.yaml \

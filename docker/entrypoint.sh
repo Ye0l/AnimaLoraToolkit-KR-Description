@@ -83,6 +83,20 @@ if [[ "${AUTO_DOWNLOAD_MODELS:-1}" == "1" ]]; then
     fi
 fi
 
+user_config="$workspace/my_character.yaml"
+if [[ ! -f "$user_config" ]]; then
+    cp "${APP_DIR:-/opt/AnimaLoraToolkit}/config/runpod-docker.yaml" "$user_config"
+    echo "Copied default training config to $user_config"
+fi
+
+if [[ "${AUTO_VALIDATE:-1}" == "1" ]]; then
+    if /usr/local/bin/validate-anima-training "$user_config"; then
+        echo "Preflight validation passed for $user_config. Training was not started automatically."
+    else
+        echo "NOTE: Preflight validation did not pass yet (e.g. dataset not uploaded). Upload your dataset and edit $user_config, then run: validate-anima-training $user_config" >&2
+    fi
+fi
+
 if [[ "$#" -eq 0 ]]; then
     set -- sleep infinity
 fi

@@ -369,7 +369,7 @@ def enable_xformers(model):
     try:
         from xformers.ops import memory_efficient_attention
     except ImportError:
-        logger.warning("xformers 未安装，跳过启用")
+        logger.warning("xformers not installed; skipping enable")
         return False
 
     enabled_count = 0
@@ -383,11 +383,11 @@ def enable_xformers(model):
             enabled_count += 1
 
     if enabled_count > 0:
-        logger.info(f"xformers 已启用: {enabled_count} 个模块")
+        logger.info(f"xformers enabled: {enabled_count} module(s)")
         return True
 
     # 如果模型没有内置支持，尝试 monkey patch
-    logger.info("xformers 已加载，将在 attention 计算中使用")
+    logger.info("xformers loaded; will be used in attention computation")
     return True
 
 
@@ -634,13 +634,13 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     if not has_llm_adapter and hasattr(model, "llm_adapter"):
         try:
             model.llm_adapter = None
-            logger.warning("检测到 checkpoint 不包含 llm_adapter 权重：已禁用 llm_adapter（回退为直接使用 Qwen embeddings）")
+            logger.warning("Detected checkpoint without llm_adapter weights: llm_adapter disabled (falling back to direct Qwen embeddings)")
         except Exception:
             pass
     model = model.to(device=device, dtype=dtype)
     model.requires_grad_(False)
 
-    logger.info(f"Anima 模型加载完成: {model_channels}ch, {num_blocks} blocks")
+    logger.info(f"Anima model loaded: {model_channels}ch, {num_blocks} blocks")
     return model
 
 
@@ -680,7 +680,7 @@ def load_vae(vae_path, device, dtype, repo_root):
     wrapper.std = std
     wrapper.scale = [mean, 1.0 / std]
 
-    logger.info("VAE 加载完成")
+    logger.info("VAE loaded")
     return wrapper
 
 
@@ -700,7 +700,7 @@ def load_text_encoders(qwen_path, t5_tokenizer_path, device, dtype):
     else:
         t5_tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
 
-    logger.info("文本编码器加载完成")
+    logger.info("Text encoder loaded")
     return qwen_model, qwen_tokenizer, t5_tokenizer
 
 
@@ -1108,7 +1108,7 @@ class LoRAInjector:
             setattr(parent, parts[-1], lora_linear)
             self.injected[name] = lora_linear
 
-        logger.info(f"注入 {'LoKr' if self.use_lokr else 'LoRA'} 到 {len(self.injected)} 层")
+        logger.info(f"Injected {'LoKr' if self.use_lokr else 'LoRA'} into {len(self.injected)} layers")
         return self.injected
 
     def get_params(self):
@@ -1145,13 +1145,13 @@ class LoRAInjector:
             "ss_network_args": f'{{"algo": "lokr", "factor": {self.factor}}}' if self.use_lokr else "{}",
         }
         save_file(sd, path, metadata=meta)
-        logger.info(f"LoRA 保存到: {path}")
+        logger.info(f"LoRA saved to: {path}")
 
     def load(self, path):
         """从 safetensors 加载已有 LoRA 权重（用于继续训练）"""
         from safetensors import safe_open
         
-        logger.info(f"加载已有 LoRA 权重: {path}")
+        logger.info(f"Loaded existing LoRA weights: {path}")
         
         # 读取权重
         sd = {}
@@ -1178,7 +1178,7 @@ class LoRAInjector:
                     lora.adapter.lora_up.weight.data.copy_(sd[up_key])
                     loaded_count += 1
         
-        logger.info(f"从 checkpoint 加载了 {loaded_count}/{len(self.injected)} 层 LoRA 权重")
+        logger.info(f"Loaded {loaded_count}/{len(self.injected)} LoRA layers from checkpoint")
 
 
 # ============================================================================
@@ -1201,12 +1201,12 @@ def save_training_state(path, injector, optimizer, epoch, global_step, loss_hist
         "monitor_state": monitor_state,  # 保存监控面板数据（用于恢复 loss 曲线）
     }
     torch.save(state, path)
-    logger.info(f"训练状态已保存: {path} (epoch={epoch}, step={global_step})")
+    logger.info(f"Training state saved: {path} (epoch={epoch}, step={global_step})")
 
 
 def load_training_state(path, injector, optimizer):
     """加载训练状态，返回 (epoch, global_step, loss_history, monitor_state)"""
-    logger.info(f"加载训练状态: {path}")
+    logger.info(f"Loading training state: {path}")
     state = torch.load(path, map_location="cpu", weights_only=False)
     
     # 加载 LoRA 权重
@@ -1244,7 +1244,7 @@ def load_training_state(path, injector, optimizer):
     loss_history = state.get("loss_history", [])
     monitor_state = state.get("monitor_state", None)  # 恢复监控数据
     
-    logger.info(f"训练状态已恢复: epoch={epoch}, step={global_step}")
+    logger.info(f"Training state restored: epoch={epoch}, step={global_step})")
     return epoch, global_step, loss_history, monitor_state
 
 
@@ -1325,16 +1325,16 @@ class ImageDataset(Dataset):
                         "normalize": caption_module.normalize_caption_json,
                         "build": caption_module.build_caption_from_json,
                     }
-                    logger.info("JSON caption 模式已启用（分类 shuffle）")
+                    logger.info("JSON caption mode enabled (category shuffle)")
                 else:
-                    logger.warning(f"caption_utils.py 未找到: {utils_path}")
+                    logger.warning(f"caption_utils.py not found: {utils_path}")
             except Exception as e:
-                logger.warning(f"caption_utils 加载失败: {e}，回退到 TXT 模式")
+                logger.warning(f"Failed to load caption_utils: {e}; falling back to TXT mode")
         
         self.samples = self._scan()
         json_count = sum(1 for s in self.samples if s.get("json_path"))
         txt_count = len(self.samples) - json_count
-        logger.info(f"数据集: {len(self.samples)} 样本 (JSON: {json_count}, TXT: {txt_count})")
+        logger.info(f"Dataset: {len(self.samples)} samples (JSON: {json_count}, TXT: {txt_count})")
 
     def _scan(self):
         from PIL import Image
@@ -1416,7 +1416,7 @@ class ImageDataset(Dataset):
                 tag_dropout=self.tag_dropout,
             )
         except Exception as e:
-            logger.warning(f"JSON 处理失败 {json_path}: {e}")
+            logger.warning(f"JSON processing failed {json_path}: {e}")
             return None
 
     def __len__(self):
@@ -1508,7 +1508,7 @@ class CachedLatentDataset(Dataset):
 
     def _build_cache(self, vae, device, dtype):
         """构建/加载 npz 缓存"""
-        logger.info("检查 VAE latent 缓存...")
+        logger.info("Checking VAE latent cache...")
         to_encode = []
         for i, sample in enumerate(self.samples):
             img_path = sample["image"]
@@ -1517,10 +1517,10 @@ class CachedLatentDataset(Dataset):
                 to_encode.append(i)
 
         if to_encode:
-            logger.info(f"需要编码 {len(to_encode)}/{len(self.samples)} 张图像...")
+            logger.info(f"Need to encode {len(to_encode)}/{len(self.samples)} images...")
             self._encode_and_save(to_encode, vae, device, dtype)
         else:
-            logger.info(f"所有 {len(self.samples)} 张图像已缓存")
+            logger.info(f"All {len(self.samples)} images already cached")
 
     def _encode_and_save(self, indices, vae, device, dtype):
         """编码图像并保存为 npz"""
@@ -1534,7 +1534,7 @@ class CachedLatentDataset(Dataset):
             npz_path = self._get_npz_path(self.samples[i]["image"])
             self.np.savez(npz_path, latent=latent_np)
             if (count + 1) % 10 == 0 or count == len(indices) - 1:
-                logger.info(f"  编码进度: {count + 1}/{len(indices)}")
+                logger.info(f"  Encoding progress: {count + 1}/{len(indices)}")
 
     def __len__(self):
         return len(self.samples)
@@ -1636,7 +1636,7 @@ def sample_image(
     # sigmas（对齐 ComfyUI supported_models.Anima: shift=3.0, multiplier=1.0）
     lat_h, lat_w = height // 8, width // 8
     if str(scheduler).lower() != "simple":
-        logger.warning(f"采样 scheduler={scheduler} 未实现，回退 simple")
+        logger.warning(f"Sampling scheduler={scheduler} not implemented; falling back to simple")
     sigmas = _flow_sigmas_simple(steps, shift=3.0, device=device)
 
     # 初始化噪声（ComfyUI CONST.noise_scaling: x = sigma*noise + (1-sigma)*latent_image；txt2img latent_image=0）
@@ -1941,7 +1941,7 @@ def main():
     config_path = None
     config_dir = None
     if args.config:
-        logger.info(f"加载配置文件: {args.config}")
+        logger.info(f"Loading config file: {args.config}")
         config_path = Path(args.config).resolve()
         config_dir = config_path.parent
         config = load_yaml_config(args.config)
@@ -2002,11 +2002,11 @@ def main():
                 "data_dir": str(args.data_dir),
             })
         except Exception as e:
-            logger.warning(f"监控面板启动失败: {e}")
+            logger.warning(f"Monitor dashboard failed to start: {e}")
 
     # 查找模型代码
     repo_root = find_diffusion_pipe_root()
-    logger.info(f"模型代码路径: {repo_root}")
+    logger.info(f"Model code path: {repo_root}")
 
     # 解析路径：相对路径优先按 config 位置 / AnimaLoraToolkit 目录解析
     script_dir = Path(__file__).resolve().parent
@@ -2026,23 +2026,23 @@ def main():
     args.data_dir = resolve_path_best_effort(args.data_dir, bases)
 
     # 加载模型
-    logger.info("加载 Transformer...")
+    logger.info("Loading transformer...")
     model = load_anima_model(args.transformer, device, dtype, repo_root)
 
     # 启用 xformers
     if args.xformers:
         enable_xformers(model)
 
-    logger.info("加载 VAE...")
+    logger.info("Loading VAE...")
     vae = load_vae(args.vae, device, dtype, repo_root)
 
-    logger.info("加载文本编码器...")
+    logger.info("Loading text encoder...")
     qwen_model, qwen_tok, t5_tok = load_text_encoders(
         args.qwen, args.t5_tokenizer, device, dtype
     )
 
     # 注入 LoRA
-    logger.info(f"注入 {args.lora_type.upper()}...")
+    logger.info(f"Injecting {args.lora_type.upper()}...")
     injector = LoRAInjector(
         rank=args.lora_rank,
         alpha=args.lora_alpha,
@@ -2054,7 +2054,7 @@ def main():
     # 从已有 LoRA 继续训练
     if getattr(args, "resume_lora", "") and Path(args.resume_lora).exists():
         injector.load(args.resume_lora)
-        logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
+        logger.info(f"Resuming training from existing LoRA: {args.resume_lora}")
 
     # 数据集
     bucket_mgr = BucketManager(args.resolution)
@@ -2078,7 +2078,7 @@ def main():
         dataset = RepeatDataset(dataset, repeats=args.repeats)
 
     if args.num_workers > 0 and os.name == "nt":
-        logger.warning("num_workers > 0 在 Windows 上容易崩溃：已强制设为 0（避免多进程 spawn 问题）")
+        logger.warning("num_workers > 0 is prone to crashing on Windows: forced to 0 (avoids multiprocessing spawn issues)")
         args.num_workers = 0
 
     # 按分桶分组的 batch sampler：保证同一批次内图像/latent 尺寸一致，
@@ -2106,9 +2106,9 @@ def main():
                 recon0 = (recon0.clamp(-1, 1) + 1) / 2
             arr0 = (recon0[0].permute(1, 2, 0).detach().cpu().float().numpy() * 255).clip(0, 255).astype("uint8")
             Image.fromarray(arr0).save(sample_dir / "vae_roundtrip.png")
-            logger.info("VAE roundtrip 自检已保存: samples/vae_roundtrip.png")
+            logger.info("VAE roundtrip self-test saved: samples/vae_roundtrip.png")
     except Exception as e:
-        logger.warning(f"VAE roundtrip 自检失败（若 sample 仍是噪点，请优先修这个）: {e}")
+        logger.warning(f"VAE roundtrip self-test failed (if samples are still noise, fix this first): {e}")
 
     # 优化器
     params = injector.get_params()
@@ -2127,7 +2127,7 @@ def main():
     else:
         total_steps = None
 
-    logger.info(f"数据集大小: {len(dataset)}, 每 epoch 步数: {steps_per_epoch}, 总步数: {total_steps}")
+    logger.info(f"Dataset size: {len(dataset)}, steps per epoch: {steps_per_epoch}, total steps: {total_steps}")
 
     # 初始化进度显示
     progress, task_id, progress_kind = init_progress(not args.no_progress, total_steps)
@@ -2170,7 +2170,7 @@ def main():
         start_epoch, global_step, loss_history, saved_monitor_state = load_training_state(
             args.resume_state, injector, optimizer
         )
-        emit(f"从断点恢复训练: epoch={start_epoch}, step={global_step}")
+        emit(f"Resuming training from checkpoint: epoch={start_epoch}, step={global_step}")
         
         # 恢复监控面板的历史数据（loss 曲线等）
         if monitor_server and saved_monitor_state:
@@ -2183,19 +2183,19 @@ def main():
                     step=global_step,
                     total_steps=total_steps,
                 )
-                emit(f"监控面板历史数据已恢复: {len(saved_monitor_state.get('losses', []))} 个 loss 点")
+                emit(f"Monitor dashboard history restored: {len(saved_monitor_state.get('losses', []))} loss point(s)")
             except Exception as e:
-                emit(f"监控数据恢复失败: {e}")
+                emit(f"Failed to restore monitor data: {e}")
     
     # Ctrl+C 信号处理：保存状态后退出
     interrupted = False
     def signal_handler(sig, frame):
         nonlocal interrupted
         if interrupted:
-            emit("强制退出...")
+            emit("Force quitting...")
             sys.exit(1)
         interrupted = True
-        emit("\n检测到 Ctrl+C，正在保存训练状态...")
+        emit("\nCtrl+C detected; saving training state...")
         state_path = output_dir / f"training_state_step{global_step}.pt"
         # 获取监控面板数据用于恢复 loss 曲线
         monitor_data = None
@@ -2209,7 +2209,7 @@ def main():
         # 同时保存 LoRA 权重
         lora_path = output_dir / f"{args.output_name}_interrupted_step{global_step}.safetensors"
         injector.save(lora_path)
-        emit(f"已保存！下次使用 --resume-state \"{state_path}\" 继续训练")
+        emit(f"Saved! Resume training next time with --resume-state \"{state_path}\"")
         sys.exit(0)
     
     import signal
@@ -2238,7 +2238,7 @@ def main():
     # 只在新训练时执行（global_step == 0），resume 时跳过
     sampling_enabled = args.sample_steps > 0 or args.sample_every > 0
     if global_step == 0 and sampling_enabled:
-        emit("采样中 (step 0, 基线)...")
+        emit("Sampling (step 0, baseline)...")
         model.eval()
         s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
         s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2261,7 +2261,7 @@ def main():
             )
             sample_path = sample_dir / f"step_0_baseline_{i}.png"
             img.save(sample_path)
-            emit(f"基线采样保存: step_0_baseline_{i}.png")
+            emit(f"Baseline sample saved: step_0_baseline_{i}.png")
             if monitor_server:
                 try:
                     update_monitor(sample_path=sample_path)
@@ -2269,7 +2269,7 @@ def main():
                     pass
         model.train()
     elif global_step > 0 and sampling_enabled:
-        emit(f"跳过启动基线采样（从 step {global_step} 恢复，非 step 0）")
+        emit(f"Skipping startup baseline sampling (resumed from step {global_step}, not step 0)")
 
     for epoch in range(start_epoch, args.epochs):
         current_epoch = epoch
@@ -2369,7 +2369,7 @@ def main():
                 if args.sample_steps > 0 and global_step % args.sample_steps == 0:
                     prompt = get_next_sample_prompt()
                     prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                    emit(f"采样中 (step {global_step}): {prompt_short}")
+                    emit(f"Sampling (step {global_step}): {prompt_short}")
                     model.eval()
                     s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
                     s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2388,7 +2388,7 @@ def main():
                     )
                     sample_path = sample_dir / f"step_{global_step}.png"
                     img.save(sample_path)
-                    emit(f"采样保存: step_{global_step}.png")
+                    emit(f"Sample saved: step_{global_step}.png")
                     if monitor_server:
                         try:
                             update_monitor(sample_path=sample_path)
@@ -2437,7 +2437,7 @@ def main():
             if args.sample_every > 0 and current_epoch % args.sample_every == 0:
                 prompt = get_next_sample_prompt()
                 prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                emit(f"采样中 (epoch {current_epoch}): {prompt_short}")
+                emit(f"Sampling (epoch {current_epoch}): {prompt_short}")
                 model.eval()
                 s_w = int(getattr(args, "sample_width", 0) or 0) or int(args.resolution)
                 s_h = int(getattr(args, "sample_height", 0) or 0) or int(args.resolution)
@@ -2456,7 +2456,7 @@ def main():
                 )
                 sample_path = sample_dir / f"epoch_{current_epoch}.png"
                 img.save(sample_path)
-                emit(f"采样保存: epoch_{current_epoch}.png")
+                emit(f"Sample saved: epoch_{current_epoch}.png")
                 model.train()
                 
                 # 更新监控面板
@@ -2486,7 +2486,7 @@ def main():
         emit(f"Loss curve (first {len(loss_history)} steps):\n{chart}")
 
     emit(f"Saved final LoRA: {final_path}")
-    logger.info("训练完成!")
+    logger.info("Training complete!")
 
 
 if __name__ == "__main__":

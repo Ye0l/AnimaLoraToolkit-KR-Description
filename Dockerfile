@@ -40,6 +40,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        btop \
         ca-certificates \
         curl \
         git \
@@ -54,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
         tmux \
         util-linux \
+        wget \
     && rm -rf /var/lib/apt/lists/* \
     && python${PYTHON_VERSION} -m venv ${VIRTUAL_ENV} \
     && mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
@@ -76,8 +78,8 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && grep -vE '^(torch|torchvision|pillow-jxlpy)([<>=!~].*)?$' \
         /tmp/requirements.txt > /tmp/requirements.runpod.txt \
     && python -m pip install --no-cache-dir -r /tmp/requirements.runpod.txt \
-    && python -m pip install --no-cache-dir \
-        'huggingface_hub>=0.34.0' \
+    && python -m pip install --no-cache-dir --upgrade \
+        'huggingface_hub>=0.36.0' \
         hf-xet \
         protobuf \
         sentencepiece \
@@ -140,6 +142,23 @@ log_every: 10
 no_monitor: true
 no_browser: true
 YAML
+
+RUN cat >> /root/.bashrc <<'BASHRC'
+
+# AnimaLoraToolkit: activate the training venv and alias btop's UTF-8 flag.
+source /opt/venv/bin/activate
+alias btop='btop --utf-force'
+
+# Auto-attach (or create) a tmux session for interactive SSH logins only,
+# so the CI smoke test's non-interactive "ssh ... true" check is unaffected.
+if [[ $- == *i* ]] && [[ -z "${TMUX:-}" ]] && [[ -t 0 ]]; then
+    exec tmux new-session -A -s main
+fi
+BASHRC
+
+RUN printf '%s\n' \
+        '[[ -f ~/.bashrc ]] && source ~/.bashrc' \
+        > /root/.bash_profile
 
 RUN chmod +x ${APP_DIR}/docker/*.sh ${APP_DIR}/docker/*.py \
     && ln -sf ${APP_DIR}/docker/download_models_direct.py /usr/local/bin/download-anima-models \
