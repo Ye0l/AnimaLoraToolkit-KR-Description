@@ -157,7 +157,7 @@ alias btop='btop --utf-force'
 # Auto-attach (or create) a tmux session for interactive SSH logins only,
 # so the CI smoke test's non-interactive "ssh ... true" check is unaffected.
 if [[ $- == *i* ]] && [[ -z "${TMUX:-}" ]] && [[ -t 0 ]]; then
-    exec tmux new-session -A -s main
+    exec tmux -u new-session -A -s main
 fi
 BASHRC
 
